@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Proof workspace runtime output
+/tmp/
+journal.jsonl
+project_state.json
+artifacts/
+snapshots/
+proof_store/
+
+# IDE
+.vscode/
+.idea/
