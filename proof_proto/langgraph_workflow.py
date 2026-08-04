@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.request
 from typing import Any, Dict, Optional
@@ -53,22 +54,26 @@ class SimpleLLMClient:
                 pass
         return {}
 
+    # Valid attempt statuses the critic may assign — anything else gets normalised to supported
+    _VALID_ATTEMPT_STATUSES = {"supported", "critic_accepted", "refuted", "retracted"}
+
     def explore(self, theorem: str, context: dict) -> dict:
+        # Include previous attempts in the prompt so the explorer doesn't repeat itself
+        previous = [a["move_summary"] for a in context.get("attempts", [])]
         prompt = (
             f"You are an explorer agent for a mathematical proof project.\n"
             f"Theorem: {theorem}\n"
-            f"Current context: {json.dumps(context, indent=2)[:3000]}\n"
-            f'Return ONLY a JSON object with lowercase keys: "move_summary", "claim_statement", "status"'
+            f"Already attempted moves (do NOT repeat these): {json.dumps(previous)}\n"
+            f"Current context: {json.dumps(context, indent=2)[:2000]}\n"
+            f'Return ONLY a JSON object with keys: "move_summary" (a new distinct proof move), '
+            f'"claim_statement" (what this move claims)'
         )
         result = self._parse_json(self._call_model(prompt))
         if "move_summary" not in result:
             return {
                 "move_summary": "Try a case split on parity",
                 "claim_statement": "The expression can be analyzed by parity",
-                "status": "conjectural",
             }
-        if "status" in result:
-            result["status"] = str(result["status"]).lower()
         return result
 
     def critique(self, theorem: str, move_summary: str, claim_statement: str, context: dict) -> dict:
@@ -77,8 +82,11 @@ class SimpleLLMClient:
             f"Theorem: {theorem}\n"
             f"Move summary: {move_summary}\n"
             f"Claim statement: {claim_statement}\n"
-            f"Context: {json.dumps(context, indent=2)[:3000]}\n"
-            f'Return ONLY a JSON object with lowercase keys: "decision", "reason", "status"'
+            f"Context: {json.dumps(context, indent=2)[:2000]}\n"
+            f'Return ONLY a JSON object with keys:\n'
+            f'  "decision": "continue" or "stop"\n'
+            f'  "reason": explanation of your verdict\n'
+            f'  "status": MUST be one of: supported, critic_accepted, refuted, retracted'
         )
         result = self._parse_json(self._call_model(prompt))
         if "decision" not in result:
@@ -90,7 +98,71 @@ class SimpleLLMClient:
         for key in ("decision", "status"):
             if key in result:
                 result[key] = str(result[key]).lower()
+        # Enforce valid status — if LLM returns something invalid, default to supported
+        if result.get("status") not in self._VALID_ATTEMPT_STATUSES:
+            result["status"] = "supported"
         return result
+
+
+class GeminiLLMClient:
+    """Gemini-backed LLM client — same interface as SimpleLLMClient."""
+
+    _VALID_ATTEMPT_STATUSES = {"supported", "critic_accepted", "refuted", "retracted"}
+
+    def __init__(self, model: str = "gemini-2.0-flash"):
+        import google.generativeai as genai
+        api_key = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")).strip()
+        genai.configure(api_key=api_key, transport="rest")
+        self._model = genai.GenerativeModel(model)
+
+    def _call(self, prompt: str) -> str:
+        return self._model.generate_content(prompt).text
+
+    def explore(self, theorem: str, context: dict) -> dict:
+        previous = [a["move_summary"] for a in context.get("attempts", [])]
+        prompt = (
+            f"You are an explorer agent for a mathematical proof project.\n"
+            f"Theorem: {theorem}\n"
+            f"Already attempted moves (do NOT repeat these): {json.dumps(previous)}\n"
+            f"Current context: {json.dumps(context, indent=2)[:2000]}\n"
+            f'Return ONLY a JSON object with exactly two string keys: "move_summary" (a new distinct proof move), '
+            f'"claim_statement" (what this move claims). Values must be plain strings, not nested objects.'
+        )
+        result = SimpleLLMClient._parse_json(self._call(prompt))
+        move = result.get("move_summary", "")
+        claim = result.get("claim_statement", "")
+        if not move or not isinstance(move, str):
+            return {"move_summary": "Try a case split on parity", "claim_statement": "The expression can be analyzed by parity"}
+        return {"move_summary": move, "claim_statement": claim if isinstance(claim, str) else ""}
+
+    def critique(self, theorem: str, move_summary: str, claim_statement: str, context: dict) -> dict:
+        prompt = (
+            f"You are a critic agent for a mathematical proof project.\n"
+            f"Theorem: {theorem}\n"
+            f"Move summary: {move_summary}\n"
+            f"Claim statement: {claim_statement}\n"
+            f"Context: {json.dumps(context, indent=2)[:2000]}\n"
+            f'Return ONLY a JSON object with keys:\n'
+            f'  "decision": "continue" or "stop"\n'
+            f'  "reason": explanation of your verdict\n'
+            f'  "status": MUST be one of: supported, critic_accepted, refuted, retracted'
+        )
+        result = SimpleLLMClient._parse_json(self._call(prompt))
+        if "decision" not in result:
+            return {"decision": "continue", "reason": "The proposed move is a plausible next step", "status": "supported"}
+        for key in ("decision", "status"):
+            if key in result:
+                result[key] = str(result[key]).lower()
+        if result.get("status") not in self._VALID_ATTEMPT_STATUSES:
+            result["status"] = "supported"
+        return result
+
+
+def make_llm_client():
+    """Return GeminiLLMClient if a Gemini/Google API key is set, else SimpleLLMClient."""
+    if os.environ.get("USE_GEMINI") and (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+        return GeminiLLMClient()
+    return SimpleLLMClient()
 
 
 class WorkflowState(TypedDict, total=False):
@@ -100,6 +172,7 @@ class WorkflowState(TypedDict, total=False):
     iteration: int
     max_iterations: int
     last_move: str
+    last_claim: str
     last_critique: str
 
 
@@ -107,12 +180,7 @@ def build_graph(llm_client: Optional[Any] = None):
     llm = llm_client or SimpleLLMClient()
 
     def init_state(state: WorkflowState) -> WorkflowState:
-        if "project" not in state or state["project"] is None:
-            project = ProofProject(state["root"], state["theorem"])
-            if "root" not in project.states:
-                project.add_state("root", "Initial theorem state")
-            project.add_claim("claim-1", "A parity-based approach is promising")
-            state["project"] = project
+        # Project is always created in run_workflow and passed in — never recreated here
         state["iteration"] = state.get("iteration", 0)
         state["max_iterations"] = state.get("max_iterations", 2)
         return state
@@ -121,7 +189,9 @@ def build_graph(llm_client: Optional[Any] = None):
         project = state["project"]
         context = project.context_for("root")
         exploration = llm.explore(state["theorem"], context)
-        attempt_id = f"attempt-{state['iteration'] + 1}"
+        # Offset attempt ID by existing count to avoid collisions across runs
+        existing = len(project.graph.get_attempts_for_state("root", project.proof_id))
+        attempt_id = f"attempt-{existing + 1}"
         project.record_attempt(
             attempt_id,
             "root",
@@ -130,23 +200,21 @@ def build_graph(llm_client: Optional[Any] = None):
             note=exploration.get("claim_statement", ""),
         )
         state["last_move"] = exploration["move_summary"]
+        state["last_claim"] = exploration.get("claim_statement", "")
         state["iteration"] = state.get("iteration", 0) + 1
         return state
 
     def critique_node(state: WorkflowState) -> WorkflowState:
         project = state["project"]
         context = project.context_for("root")
-        exploration = {
-            "move_summary": state["last_move"],
-            "claim_statement": "A parity-based approach is promising",
-        }
         critique = llm.critique(
             state["theorem"],
-            exploration["move_summary"],
-            exploration.get("claim_statement", ""),
+            state["last_move"],
+            state.get("last_claim", ""),
             context,
         )
-        attempt_id = f"attempt-{state['iteration']}"
+        existing = len(project.graph.get_attempts_for_state("root", project.proof_id))
+        attempt_id = f"attempt-{existing}"
         project.mark_attempt(
             attempt_id,
             critique["status"],
@@ -178,9 +246,9 @@ def run_workflow(
 ) -> Dict[str, Any]:
     """Run a minimal LangGraph workflow over the proof workspace."""
 
-    graph = build_graph(llm_client)
+    graph = build_graph(llm_client or make_llm_client())
     project = ProofProject(root, theorem)
-    if "root" not in project.states:
+    if project.graph.get_state("root", project.proof_id) is None:
         project.add_state("root", "Initial theorem state")
     project.add_claim("claim-1", "A parity-based approach is promising")
 
