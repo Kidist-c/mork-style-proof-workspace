@@ -10,8 +10,11 @@ class ProofProjectTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.mkdtemp(prefix="proof-proto-", dir="/tmp")
         self.project = ProofProject(self.temp_dir, "For all n, n^2 + n is even")
+        # Wipe any leftover Neo4j data from previous runs under this proof_id
+        self.project.graph.wipe_and_rebuild(self.project.proof_id, [])
 
     def tearDown(self) -> None:
+        self.project.close()
         shutil.rmtree(self.temp_dir)
 
     def test_init_creates_journal_and_state(self) -> None:
@@ -31,11 +34,20 @@ class ProofProjectTests(unittest.TestCase):
         updated = self.project.mark_attempt("attempt-1", "critic_accepted", "A parity case split worked")
         self.assertEqual(updated["status"], "critic_accepted")
 
+        # Verify state is in Neo4j
+        neo_state = self.project.graph.get_state("root", self.project.proof_id)
+        self.assertEqual(neo_state["status"], "open")
+
+        # Verify attempt is in Neo4j via graph traversal
+        attempts = self.project.graph.get_attempts_for_state("root", self.project.proof_id)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0]["status"], "critic_accepted")
+
     def test_export_snapshot_writes_json(self) -> None:
         self.project.add_state("root", "Initial theorem state")
         snapshot = self.project.export_snapshot()
         self.assertTrue(snapshot.exists())
-        self.assertIn("states", snapshot.read_text(encoding="utf-8"))
+        self.assertIn("claims", snapshot.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
