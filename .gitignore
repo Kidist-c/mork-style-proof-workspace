@@ -9,6 +9,10 @@ __pycache__/
 venv/
 env/
 
+# Environment variable files
+.env
+.env.*
+
 # Proof workspace runtime output
 /tmp/
 journal.jsonl
