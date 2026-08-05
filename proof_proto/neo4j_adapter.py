@@ -191,6 +191,17 @@ class Neo4jAdapter:
                 evidence=evidence,
             )
 
+    def close_state(self, state_id: str, proof_id: str, reason: str = "") -> None:
+        """Mark a state as closed — proof is complete for this state."""
+        with self._driver.session() as s:
+            s.run(
+                "MATCH (st:State {id: $id, proof_id: $proof_id}) "
+                "SET st.status = 'closed', st.closed_reason = $reason",
+                id=state_id,
+                proof_id=proof_id,
+                reason=reason,
+            )
+
     def get_attempts_for_state(self, state_id: str, proof_id: str = "") -> List[Dict[str, Any]]:
         """Get all attempts that worked on a given state, scoped to a proof."""
         with self._driver.session() as s:
@@ -289,3 +300,5 @@ class Neo4jAdapter:
         elif t == "attempt_updated":
             a = p["attempt"]
             self.update_attempt(a["id"], a["status"], a.get("evidence", ""))
+        elif t == "state_closed":
+            self.close_state(p["state_id"], proof_id, p.get("reason", ""))
