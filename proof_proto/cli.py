@@ -56,7 +56,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  THEOREM: {args.theorem}")
         print("=" * 60)
         print(f"  proof_id : {project.proof_id}")
-        print(f"  status   : {state['status']}")
+        print(f"  status   : {state['status'].upper()}")
+        if state['status'] == 'closed':
+            print(f"  closed   : {state.get('closed_reason', '')}")
         print(f"  snapshot : {result['snapshot_path']}")
         print()
         print(f"  ATTEMPTS ({len(attempts)} total)")
