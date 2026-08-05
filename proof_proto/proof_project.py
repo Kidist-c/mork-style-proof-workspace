@@ -128,6 +128,10 @@ class ProofProject:
         self._append_event("attempt_updated", {"attempt": attempt})
         return attempt
 
+    def close_state(self, state_id: str, reason: str = "") -> None:
+        self.graph.close_state(state_id, self.proof_id, reason)
+        self._append_event("state_closed", {"state_id": state_id, "reason": reason})
+
     def write_artifact(self, name: str, content: str, kind: str = "note") -> Dict[str, Any]:
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
         artifact_path = self.artifact_dir / f"{digest}_{name.replace(' ', '_')}.txt"
