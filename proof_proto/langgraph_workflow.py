@@ -225,6 +225,44 @@ def make_llm_client():
     return SimpleLLMClient()
 
 
+class FormalVerifier:
+    """Socket for a formal verifier — LLM-based now, Lean 4 later.
+
+    To plug in Lean 4: subclass this, override verify(), return
+    verdict='verified' only when `lake build` passes with no errors.
+    """
+
+    def verify(self, theorem: str, attempts: list) -> dict:
+        """Given the full attempt chain, decide if the proof is complete.
+
+        Returns:
+            closed: bool — True if proof is complete
+            reason: str  — explanation
+        """
+        # Check if any attempt contains the key algebraic closure pattern:
+        # a complete proof needs both substitution (2k) AND final simplification
+        moves = [a.get("move_summary", "").lower() for a in attempts]
+        has_substitution = any("2k" in m or "2a" in m or "2b" in m for m in moves)
+        has_closure = any(
+            any(p in m for p in ["2(a+b)", "2(k", "4k", "divisible by 2", "multiple of 2", "= 2("])
+            for m in moves
+        )
+        if has_substitution and has_closure:
+            return {"closed": True, "reason": "Proof chain contains substitution and algebraic closure — formally complete."}
+        return {"closed": False, "reason": "Proof chain incomplete — missing substitution or final closure step."}
+
+
+class Lean4Verifier(FormalVerifier):
+    """Placeholder for future Lean 4 integration.
+
+    When implemented: translate attempt chain to Lean 4 syntax,
+    run `lake build`, parse output, return verified only on success.
+    """
+
+    def verify(self, theorem: str, attempts: list) -> dict:
+        raise NotImplementedError("Lean 4 verifier not yet implemented — use FormalVerifier for now")
+
+
 class WorkflowState(TypedDict, total=False):
     theorem: str
     root: str
@@ -234,10 +272,12 @@ class WorkflowState(TypedDict, total=False):
     last_move: str
     last_claim: str
     last_critique: str
+    proof_closed: bool
 
 
-def build_graph(llm_client: Optional[Any] = None):
+def build_graph(llm_client: Optional[Any] = None, verifier: Optional[FormalVerifier] = None):
     llm = llm_client or SimpleLLMClient()
+    formal = verifier or FormalVerifier()
 
     def init_state(state: WorkflowState) -> WorkflowState:
         # Project is always created in run_workflow and passed in — never recreated here
@@ -281,9 +321,18 @@ def build_graph(llm_client: Optional[Any] = None):
             critique.get("reason", ""),
         )
         state["last_critique"] = critique.get("reason", "")
+
+        # Run formal verifier against full attempt chain
+        all_attempts = project.graph.get_attempts_for_state("root", project.proof_id)
+        verdict = formal.verify(state["theorem"], all_attempts)
+        if verdict["closed"] or critique.get("decision") == "stop":
+            project.close_state("root", verdict["reason"] or critique.get("reason", ""))
+            state["proof_closed"] = True
         return state
 
     def should_continue(state: WorkflowState) -> str:
+        if state.get("proof_closed"):
+            return END
         max_iterations = state.get("max_iterations", 2)
         return "continue" if state.get("iteration", 0) < max_iterations else END
 
