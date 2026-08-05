@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  [{a['id']}]  status: {a['status']}")
             print(f"  Move    : {a['move_summary']}")
             print(f"  Claim   : {a['note']}")
-            print(f"  Verdict : {a['evidence']}")
+            print(f"  Verdict : {a.get('evidence', 'pending — no verdict yet')}")
             print()
         print("=" * 60)
     finally:

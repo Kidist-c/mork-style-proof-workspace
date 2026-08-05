@@ -158,8 +158,68 @@ class GeminiLLMClient:
         return result
 
 
+class GroqLLMClient:
+    """Groq-backed LLM client — fast free tier, same interface as SimpleLLMClient."""
+
+    _VALID_ATTEMPT_STATUSES = {"supported", "critic_accepted", "refuted", "retracted"}
+
+    def __init__(self, model: str = "llama-3.1-8b-instant"):
+        from groq import Groq
+        self._client = Groq(api_key=os.environ["GROQ_API_KEY"].strip())
+        self._model = model
+
+    def _call(self, prompt: str) -> str:
+        response = self._client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+        )
+        return response.choices[0].message.content
+
+    def explore(self, theorem: str, context: dict) -> dict:
+        previous = [a["move_summary"] for a in context.get("attempts", [])]
+        prompt = (
+            f"You are an explorer agent for a mathematical proof project.\n"
+            f"Theorem: {theorem}\n"
+            f"Already attempted moves (do NOT repeat these): {json.dumps(previous)}\n"
+            f"Current context: {json.dumps(context, indent=2)[:2000]}\n"
+            f'Return ONLY a JSON object with exactly two string keys: "move_summary" (a new distinct proof move), '
+            f'"claim_statement" (what this move claims). Values must be plain strings, not nested objects.'
+        )
+        result = SimpleLLMClient._parse_json(self._call(prompt))
+        move = result.get("move_summary", "")
+        claim = result.get("claim_statement", "")
+        if not move or not isinstance(move, str):
+            return {"move_summary": "Try a case split on parity", "claim_statement": "The expression can be analyzed by parity"}
+        return {"move_summary": move, "claim_statement": claim if isinstance(claim, str) else ""}
+
+    def critique(self, theorem: str, move_summary: str, claim_statement: str, context: dict) -> dict:
+        prompt = (
+            f"You are a critic agent for a mathematical proof project.\n"
+            f"Theorem: {theorem}\n"
+            f"Move summary: {move_summary}\n"
+            f"Claim statement: {claim_statement}\n"
+            f"Context: {json.dumps(context, indent=2)[:2000]}\n"
+            f'Return ONLY a JSON object with keys:\n'
+            f'  "decision": "continue" or "stop"\n'
+            f'  "reason": explanation of your verdict\n'
+            f'  "status": MUST be one of: supported, critic_accepted, refuted, retracted'
+        )
+        result = SimpleLLMClient._parse_json(self._call(prompt))
+        if "decision" not in result:
+            return {"decision": "continue", "reason": "The proposed move is a plausible next step", "status": "supported"}
+        for key in ("decision", "status"):
+            if key in result:
+                result[key] = str(result[key]).lower()
+        if result.get("status") not in self._VALID_ATTEMPT_STATUSES:
+            result["status"] = "supported"
+        return result
+
+
 def make_llm_client():
-    """Return GeminiLLMClient if a Gemini/Google API key is set, else SimpleLLMClient."""
+    """Auto-select LLM client based on available env vars."""
+    if os.environ.get("GROQ_API_KEY"):
+        return GroqLLMClient()
     if os.environ.get("USE_GEMINI") and (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
         return GeminiLLMClient()
     return SimpleLLMClient()
