@@ -26,9 +26,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Base URL for the local Ollama server",
     )
     parser.add_argument(
+        "--provider",
+        choices=("auto", "groq", "ollama"),
+        default="auto",
+        help="LLM provider to use; auto picks Groq when GROQ_API_KEY is set, else Ollama",
+    )
+    parser.add_argument(
         "--model",
-        default="llama3.1:8b",
-        help="Model name to use with Ollama",
+        help="Model name for the selected provider",
     )
     return parser
 
@@ -37,7 +42,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     root = Path(args.root) if args.root else Path(tempfile.mkdtemp(prefix="proof-workflow-"))
-    llm_client = make_llm_client()
+    llm_client = make_llm_client(
+        provider=args.provider,
+        model=args.model,
+        ollama_url=args.ollama_url,
+    )
 
     result = run_workflow(
         theorem=args.theorem,
@@ -49,6 +58,7 @@ def main(argv: list[str] | None = None) -> int:
     project = result["project"]
     try:
         attempts = project.graph.get_attempts_for_state("root", project.proof_id)
+        moves = project.graph.get_moves_for_state("root", project.proof_id)
         state = project.graph.get_state("root", project.proof_id)
 
         print()
@@ -61,6 +71,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  closed   : {state.get('closed_reason', '')}")
         print(f"  snapshot : {result['snapshot_path']}")
         print()
+        print(f"  MOVES ({len(moves)} total) — search DAG")
+        print("-" * 60)
+        for m in reversed(moves):
+            print(f"  [{m['id']}]  kind: {m.get('kind', 'reduction')}  status: {m['status']}")
+            print(f"  Move    : {m['move_summary']}")
+            subgoals = project.graph.get_subgoals_for_move(m["id"], project.proof_id)
+            if subgoals:
+                print(f"  Subgoals ({len(subgoals)}):")
+                for sg in subgoals:
+                    print(f"    - [{sg['id']}] {sg['description']}")
+            print()
         print(f"  ATTEMPTS ({len(attempts)} total)")
         print("-" * 60)
         for a in reversed(attempts):
@@ -74,3 +95,7 @@ def main(argv: list[str] | None = None) -> int:
         project.close()
 
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
