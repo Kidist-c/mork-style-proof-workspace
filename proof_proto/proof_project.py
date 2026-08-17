@@ -125,6 +125,11 @@ class ProofProject:
         return claim
 
     def add_claim_dependency(self, dependent_claim_id: str, depends_on_claim_id: str) -> None:
+        if self.graph._would_create_cycle(dependent_claim_id, depends_on_claim_id, self.proof_id):
+            raise ValueError(
+                f"Adding DEPENDS_ON {dependent_claim_id} -> {depends_on_claim_id} "
+                f"would create a cycle in the claim dependency graph"
+            )
         event = self._append_event(
             "claim_dependency_added",
             {"dependent_claim_id": dependent_claim_id, "depends_on_claim_id": depends_on_claim_id},

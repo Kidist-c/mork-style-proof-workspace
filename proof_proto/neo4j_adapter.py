@@ -5,8 +5,7 @@ from typing import Any, Dict, List, Optional, Set
 from neo4j import GraphDatabase
 
 # ----------------------------------------------------------------------------
-# Protocol status enums (paper §2.7 / §4.6). The commit gate validates against
-# these; PLN "truth values" are annotations and can never substitute for them.
+# Protocol status enums. The commit gate validates against
 # ----------------------------------------------------------------------------
 
 STATE_STATUSES = {"open", "closed", "tainted", "reopened"}
@@ -15,36 +14,34 @@ CLAIM_STATUSES = {
     "conjectural", "empirical", "provisional", "critic_accepted",
     "lean_verified", "refuted", "retracted", "stale",
 }
+#  not mentioned in the paper might remove it later. 
 ATTEMPT_STATUSES = {"pending", "supported", "critic_accepted", "refuted", "retracted"}
 
 # Relationship types accepted by the generic add_relation() linker.
 # Keeping an explicit allowlist means relationship type is never interpolated
 # from untrusted input.
 _REL_WHITELIST = {
-    # search DAG (§4.1)
+    # search DAG 
     "SUPERSEDES", "ALTERNATIVE_TO", "GENERALIZES", "REFORMULATES", "FORMALIZES",
     "CONTRADICTS", "STRENGTHENS_ROUTE", "LEAVES_OPEN", "REDUCES_TARGET",
     "EXPOSES_BARRIER", "BYPASSES",
-    # justification DAG (§4.2)
+    # justification DAG 
     "SUPPORTED_BY", "PROVED_BY", "CONTRADICTED_BY", "VERIFIED_BY",
     "VERIFIED_BY_EXPERIMENT", "INVALIDATES",
     # state -> claim reference (used for taint reopening)
     "USES_CLAIM",
-    # speculative layer (§4.4)
+    # speculative layer 
     "SUGGESTS", "EXPECTS", "SOURCE_CONCEPT", "RELATED_TO", "FALSIFIED_BY",
     "ELABORATED_INTO",
 }
 
-# All node labels in the metagraph (paper §4.5).
+# All node labels in the metagraph.
 _LABELS = (
     "Proof", "State", "Claim", "Move", "Attempt", "Route", "Artifact",
     "Context", "Hypothesis", "Concept", "Critique", "Experiment", "Verification",
 )
 
-# Old prototype constraints that must be migrated once.
-_LEGACY_CONSTRAINTS = ("attempt_id", "claim_id", "move_id", "proof_id", "state_id")
-
-
+# prevents bad data from slipping in
 def _check(value: str, allowed: Set[str], label: str) -> None:
     if value not in allowed:
         raise ValueError(
@@ -70,29 +67,14 @@ class Neo4jAdapter:
         password: str = "proofagent123",
     ):
         self._driver = GraphDatabase.driver(uri, auth=(user, password))
-        self._ensure_constraints()
+        self._ensure_constraints()  #this create a unique constraints for each node type usiing compostie key (proof_id,id)
 
     def close(self) -> None:
         self._driver.close()
 
-    # ------------------------------------------------------------------
-    # Schema — composite (proof_id, id) uniqueness + status indexes.
-    # A one-time migration detects the legacy single-property uniqueness
-    # constraints, drops them, and wipes the stale namespace-less data.
-    # (Composite UNIQUE is Community-edition safe; NODE KEY would require
-    # Enterprise.)
-    # ------------------------------------------------------------------
-
+    
     def _ensure_constraints(self) -> None:
         with self._driver.session() as s:
-            names = {r["name"] for r in s.run("SHOW CONSTRAINTS YIELD name RETURN name")}
-            if _LEGACY_CONSTRAINTS and names.intersection(_LEGACY_CONSTRAINTS):
-                for name in _LEGACY_CONSTRAINTS:
-                    s.run(f"DROP CONSTRAINT {name} IF EXISTS")
-                # Neo4j is a derived projection of the on-disk journals; the
-                # legacy graph has no proof_id on Proof nodes and cannot be
-                # re-keyed, so wipe it and let replay rebuild from journals.
-                s.run("MATCH (n) DETACH DELETE n")
             for label in _LABELS:
                 s.run(
                     f"CREATE CONSTRAINT {label.lower()}_key IF NOT EXISTS "
@@ -106,6 +88,26 @@ class Neo4jAdapter:
 
     def _edge_id(self, event_id: str, kind: str) -> str:
         return f"{event_id}-{kind}" if kind else event_id
+
+    def _would_create_cycle(
+        self,
+        dependent_claim_id: str,
+        depends_on_claim_id: str,
+        proof_id: str = "",
+    ) -> bool:
+        """Return True if adding DEPENDS_ON from dependent→depends_on would close a cycle.
+
+        Checks whether *depends_on_claim_id* can already reach
+        *dependent_claim_id* through existing DEPENDS_ON edges.
+        """
+        with self._driver.session() as s:
+            result = s.run(
+                "MATCH path = (b:Claim {id: $b_id, proof_id: $pid})"
+                "-[:DEPENDS_ON*1..]->(a:Claim {id: $a_id, proof_id: $pid}) "
+                "RETURN path LIMIT 1",
+                b_id=depends_on_claim_id, a_id=dependent_claim_id, pid=proof_id,
+            )
+            return result.single() is not None
 
     # ------------------------------------------------------------------
     # Proof node — one per theorem project (namespace anchor)
@@ -131,7 +133,7 @@ class Neo4jAdapter:
             )
 
     # ------------------------------------------------------------------
-    # States (search DAG — OR point)
+    # States (search DAG — OR point) - a problem state in the search process
     # ------------------------------------------------------------------
 
     def add_state(
@@ -262,6 +264,7 @@ class Neo4jAdapter:
             )
             return [dict(r["c"]) for r in result]
 
+    # this creates a DEPENDS_ON relationship between two claims
     def add_claim_dependency(
         self,
         dependent_claim_id: str,
@@ -269,7 +272,12 @@ class Neo4jAdapter:
         proof_id: str = "",
         event_id: str = "",
     ) -> None:
-        """DEPENDS_ON edge — the justification DAG. Gate forbids cycles."""
+        """DEPENDS_ON edge — raises ValueError if it would create a cycle."""
+        if proof_id and self._would_create_cycle(dependent_claim_id, depends_on_claim_id, proof_id):
+            raise ValueError(
+                f"Adding DEPENDS_ON {dependent_claim_id} -> {depends_on_claim_id} "
+                f"would create a cycle in the claim dependency graph"
+            )
         with self._driver.session() as s:
             s.run(
                 "MATCH (a:Claim {id: $a_id}), (b:Claim {id: $b_id}) "
@@ -281,7 +289,7 @@ class Neo4jAdapter:
                 a_id=dependent_claim_id, b_id=depends_on_claim_id,
                 pid=proof_id, eid=self._edge_id(event_id, "DEPENDS_ON"), evt=event_id,
             )
-
+    #this creates USES_CLAIM  realationship between state and claim 
     def link_state_claim(
         self,
         proof_id: str,
@@ -417,7 +425,7 @@ class Neo4jAdapter:
             return [dict(r["st"]) for r in result]
 
     def eligible_frontier(self, proof_id: str) -> List[Dict[str, Any]]:
-        """Eligible moves for leasing (paper §4.7).
+        """Eligible moves for leasing (paper section 4.7).
 
         (Open ∪ Reopened) − (Leased ∪ Refuted ∪ Dominated ∪ Exhausted),
         restricted to moves whose state is not tainted/refuted.
@@ -435,7 +443,8 @@ class Neo4jAdapter:
             return [dict(r["m"]) for r in result]
 
     # ------------------------------------------------------------------
-    # Attempts (provenance DAG)
+    # Attempts (provenance DAG) 
+    # attempt - is an execution record
     # ------------------------------------------------------------------
 
     def add_attempt(
@@ -559,6 +568,7 @@ class Neo4jAdapter:
 
     # ------------------------------------------------------------------
     # Routes, artifacts, contexts (provenance DAG)
+    # routes - is a path used during the proof search ( a file system , a code path , an execution route, a tool route)
     # ------------------------------------------------------------------
 
     def add_route(self, proof_id: str, route_id: str, display_path: str, event_id: str = "") -> None:
@@ -568,6 +578,7 @@ class Neo4jAdapter:
                 "ON CREATE SET r.display_path = $path, r.created_in_event = $evt",
                 pid=proof_id, id=route_id, path=display_path, evt=event_id,
             )
+    #  artifact is something produced during the proof process like file , validation  output
 
     def add_artifact(
         self,
@@ -599,6 +610,8 @@ class Neo4jAdapter:
                 eid=self._edge_id(event_id, "PRODUCED_ARTIFACT"), evt=event_id,
             )
 
+    # context node captures packet_hash , complier_version, token_budget, token_count. and used for reproduciblity 
+
     def add_context(
         self,
         proof_id: str,
@@ -622,7 +635,7 @@ class Neo4jAdapter:
     # ------------------------------------------------------------------
     # Critics, experiments, verification (independent checks)
     # ------------------------------------------------------------------
-
+    # creates a critque node which is basically a negative review of an attempt
     def add_critique(
         self,
         proof_id: str,
@@ -648,7 +661,7 @@ class Neo4jAdapter:
                 pid=proof_id, aid=attempt_id, cid=critique_id,
                 eid=self._edge_id(event_id, "HAD_CRITIQUE"), evt=event_id,
             )
-
+    # 
     def add_experiment(
         self,
         proof_id: str,
@@ -672,7 +685,7 @@ class Neo4jAdapter:
                 pid=proof_id, aid=attempt_id, eid=experiment_id,
                 edge=self._edge_id(event_id, "RAN"), evt=event_id,
             )
-
+    #  this is a formal or lean verification result attached to a clain
     def add_verification(
         self,
         proof_id: str,
@@ -939,7 +952,7 @@ class Neo4jAdapter:
         }
 
     # ------------------------------------------------------------------
-    # Rebuild from journal — Neo4j is never the source of truth
+    # Rebuild from journal
     # ------------------------------------------------------------------
 
     def wipe_and_rebuild(self, proof_id: str, events: List[Dict[str, Any]]) -> None:
