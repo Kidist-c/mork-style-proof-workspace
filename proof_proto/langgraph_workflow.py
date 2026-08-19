@@ -3,6 +3,10 @@
 Agents:
   - explorer: proposes proof moves (search DAG: Move from an OR state, with AND subgoals)
   - critic:   verdicts each move and decides whether to keep exploring or stop
+  - formalizer:  loop at claim granularity: draft a Lean 4 translation, run a theorem-statement
+                  equivalence review, invoke Lean, classify any error, attempt one repair,
+                  commit the source/log as artifacts, and promote to lean_verified only
+                  when the kernel genuinely accepts a sorry-free, axiom-clean statement
 
 LLM clients differ only in *how* they call the model; prompting and response
 normalisation live on the shared ``LLMClient`` base. The formal verifier is a
@@ -10,18 +14,20 @@ pluggable socket (heuristic now, Lean 4 later).
 """
 
 from __future__ import annotations
-
+import hashlib
 import json
 import os
 import re
 import urllib.request
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Optional
-
+import shutil
+import subprocess
+import tempfile
+import time
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
-
+from typing import Any, Dict, List, Optional
 from proof_proto.proof_project import ProofProject
 
 ROOT_STATE_ID = "root"
