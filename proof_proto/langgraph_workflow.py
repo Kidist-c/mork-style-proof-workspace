@@ -487,7 +487,6 @@ def classify_lean_error(output: str, *, timed_out: bool = False) -> str:
 
 class LeanChecker:
     
-
     def __init__(self, binary: str = "lean", timeout_seconds: int = 20):
         self.binary = binary
         self.timeout_seconds = timeout_seconds

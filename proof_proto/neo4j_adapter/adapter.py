@@ -185,6 +185,30 @@ class Neo4jAdapter(ReplayMixin, RulesMixin):
                 "                            THEN $reason ELSE c.status_reason END",
                 id=claim_id, status=status, pid=proof_id, evt=event_id, reason=reason,
             )
+    def record_lean_formalization(
+            self,
+            proof_id: str,
+            claim_id: str,
+            lean_name: str = "",
+            lean_statement_path: str = "",
+            namespace: str = "",
+            toolchain_hash: str = "",
+            mathlib_revision: str = "",
+            formalization_status: str = "",
+            last_compiler_output: str = "",
+            event_id: str = "",
+        ) -> None:
+            with self._driver.session() as s:
+                s.run(
+                    "MATCH (c:Claim {proof_id: $pid, id: $id}) "
+                    "SET c.lean_name = $lname, c.lean_statement_path = $path, "
+                    "    c.lean_namespace = $ns, c.toolchain_hash = $tool, "
+                    "    c.mathlib_revision = $mathlib, c.formalization_status = $fstatus, "
+                    "    c.last_compiler_output = $output, c.lean_updated_in_event = $evt",
+                    pid=proof_id, id=claim_id, lname=lean_name, path=lean_statement_path,
+                    ns=namespace, tool=toolchain_hash, mathlib=mathlib_revision,
+                    fstatus=formalization_status, output=last_compiler_output[:2000], evt=event_id,
+                )
 
     def get_all_claims(self, proof_id: str) -> List[Dict[str, Any]]:
         with self._driver.session() as s:
@@ -604,15 +628,24 @@ class Neo4jAdapter(ReplayMixin, RulesMixin):
         lean_name: str = "",
         toolchain_hash: str = "",
         event_id: str = "",
+        mathlib_revision: str = "",
+        error_category: str = "",
+        axioms_used: Optional[List[str]] = None,
+        timing_seconds: float = 0.0,
+        source_hash: str = "",
     ) -> None:
         with self._driver.session() as s:
             s.run(
                 "MERGE (v:Verification {proof_id: $pid, id: $id}) "
                 "ON CREATE SET v.kind = $kind, v.status = $status, "
                 "              v.lean_name = $lname, v.toolchain_hash = $tool, "
-                "              v.created_in_event = $evt",
+                "              v.mathlib_revision = $mathlib, v.error_category = $cat, "
+                "              v.axioms_used = $axioms, v.timing_seconds = $timing, "
+                "              v.source_hash = $shash, v.created_in_event = $evt",
                 pid=proof_id, id=verification_id, kind=kind, status=status,
-                lname=lean_name, tool=toolchain_hash, evt=event_id,
+                lname=lean_name, tool=toolchain_hash, mathlib=mathlib_revision,
+                cat=error_category, axioms=list(axioms_used or []), timing=timing_seconds,
+                shash=source_hash, evt=event_id,
             )
             s.run(
                 "MATCH (a:Attempt {proof_id: $pid, id: $aid}), (v:Verification {proof_id: $pid, id: $vid}) "
