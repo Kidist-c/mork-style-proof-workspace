@@ -144,6 +144,32 @@ class ProofProject:
         self.graph.update_claim_status(claim_id, status, self.proof_id, event["id"], reason)
         return {"id": claim_id, "status": status, "reason": reason}
 
+    def record_lean_formalization(
+            self,
+            claim_id: str,
+            lean_name: str = "",
+            lean_statement_path: str = "",
+            namespace: str = "",
+            toolchain_hash: str = "",
+            mathlib_revision: str = "",
+            formalization_status: str = "",
+            last_compiler_output: str = "",
+        ) -> Dict[str, Any]:
+            """Section 11.2: write the Lean-specific fields onto an existing claim."""
+            record = {
+                "claim_id": claim_id, "lean_name": lean_name,
+                "lean_statement_path": lean_statement_path, "namespace": namespace,
+                "toolchain_hash": toolchain_hash, "mathlib_revision": mathlib_revision,
+                "formalization_status": formalization_status,
+            }
+            event = self._append_event("lean_formalization_recorded", record)
+            self.graph.record_lean_formalization(
+                self.proof_id, claim_id, lean_name, lean_statement_path, namespace,
+                toolchain_hash, mathlib_revision, formalization_status,
+                last_compiler_output, event_id=event["id"],
+            )
+            return record
+
     def propagate_taint(self, claim_id: str, reason: str = "") -> Dict[str, Any]:
         """Journal a refutation + taint cascade and project it into the graph."""
         event = self._append_event(
@@ -327,21 +353,30 @@ class ProofProject:
         return experiment
 
     def add_verification(
-        self, attempt_id: str, claim_id: str, kind: str = "lean",
-        status: str = "pending", lean_name: str = "", toolchain_hash: str = "",
-    ) -> Dict[str, Any]:
-        verification_id = self._next_id("ver")
-        verification = {
-            "id": verification_id, "kind": kind, "status": status,
-            "lean_name": lean_name, "toolchain_hash": toolchain_hash,
-        }
-        event = self._append_event(
-            "verification_added",
-            {"attempt_id": attempt_id, "claim_id": claim_id, "verification": verification},
-        )
-        self.graph.add_verification(self.proof_id, verification_id, attempt_id, claim_id,
-                                    kind, status, lean_name, toolchain_hash, event["id"])
-        return verification
+            self, attempt_id: str, claim_id: str, kind: str = "lean",
+            status: str = "pending", lean_name: str = "", toolchain_hash: str = "",
+            mathlib_revision: str = "", error_category: str = "",
+            axioms_used: Optional[List[str]] = None, timing_seconds: float = 0.0,
+            source_hash: str = "",
+        ) -> Dict[str, Any]:
+            verification_id = self._next_id("ver")
+            verification = {
+                "id": verification_id, "kind": kind, "status": status,
+                "lean_name": lean_name, "toolchain_hash": toolchain_hash,
+                "mathlib_revision": mathlib_revision, "error_category": error_category,
+                "axioms_used": list(axioms_used or []), "timing_seconds": timing_seconds,
+                "source_hash": source_hash,
+            }
+            event = self._append_event(
+                "verification_added",
+                {"attempt_id": attempt_id, "claim_id": claim_id, "verification": verification},
+            )
+            self.graph.add_verification(
+                self.proof_id, verification_id, attempt_id, claim_id, kind, status,
+                lean_name, toolchain_hash, event["id"], mathlib_revision, error_category,
+                axioms_used, timing_seconds, source_hash,
+            )
+            return verification
 
     # ------------------------------------------------------------------
     # Semantic relations (bypasses, supersedes, ...) + speculative layer
