@@ -18,6 +18,8 @@ import hashlib
 import json
 import os
 import re
+from unittest import result
+from unittest import result
 import urllib.request
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -54,6 +56,31 @@ DEFAULT_CRITIQUE: dict[str, Any] = {
     "status": "supported",
 }
 
+FALLBACK_FORMALIZATION: dict[str, Any] = {
+    "translatable": False,
+    "lean_code": "",
+    "lean_name": "",
+    "explanation": "Could not parse a formalization response from the model.",
+}
+
+FALLBACK_EQUIVALENCE: dict[str, Any] = {
+    "relation": "unclear",
+    "notes": "Could not parse an equivalence-review response from the model.",
+}
+
+
+LEAN_ERROR_CATEGORIES = (
+    "translation_ambiguity",
+    "missing_definition_or_library_lemma",
+    "elaboration_type_mismatch",
+    "tactic_search_failure",
+    "resource_timeout",
+    "inconsistent_assumptions",
+    "likely_mathematical_gap",
+   "formal_statement_stronger_than_informal",
+)
+
+
 
 # ---------------------------------------------------------------------------
 # Prompt building and response parsing
@@ -87,6 +114,63 @@ def _critique_prompt(theorem: str, move_summary: str, claim_statement: str, cont
         f'  "reason": explanation of your verdict\n'
         f'  "status": MUST be one of: {statuses}'
     )
+
+def _formalize_prompt(theorem: str, move_summary: str, claim_statement: str, context: dict) -> str:
+    return (
+        f"You are a formalizer agent for a mathematical proof project. Your job is to\n"
+        f"translate an informally-stated claim into Lean 4 syntax, not to invent a new\n"
+        f"proof. Use `sorry` for any tactic steps you cannot fill in yet.\n"
+        f"Theorem: {theorem}\n"
+        f"Move summary: {move_summary}\n"
+        f"Claim statement (the exact proposition to formalize): {claim_statement}\n"
+        f"Context: {json.dumps(context, indent=2)[:2000]}\n"
+        f"Return ONLY a JSON object with exactly these keys:\n"
+        f'  "translatable" — true or false: can this claim be meaningfully stated\n'
+        f"    in Lean 4 right now (even with `sorry` in the proof body)?\n"
+        f'  "lean_code" — a best-effort Lean 4 snippet (a `theorem`/`lemma` header plus a\n'
+        f"    proof body); empty string if translatable is false\n"
+        f'  "lean_name" — a valid Lean identifier (snake_case) naming the statement;\n'
+        f"    empty string if translatable is false\n"
+        f'  "explanation" — one or two sentences on why it is/isn\'t translatable, or on\n'
+        f"    what was left as `sorry`"
+    )
+
+
+def _equivalence_prompt(claim_statement: str, lean_code: str) -> str:
+    return (
+        f"You are reviewing a Lean 4 translation for faithfulness to an informal claim.\n"
+        f"Do not judge whether the Lean code compiles — only whether, if it did compile,\n"
+        f"it would say the same mathematical thing as the informal claim: same quantifiers,\n"
+        f"same domain, same strength.\n"
+        f"Informal claim: {claim_statement}\n"
+        f"Lean 4 statement:\n{lean_code}\n"
+        f"Return ONLY a JSON object with exactly these keys:\n"
+        f'  "relation" — exactly one of: "equivalent", "stronger", "weaker", "unrelated"\n'
+        f"    (\"stronger\" means the Lean statement claims more than the informal claim did;\n"
+        f"    \"weaker\" means it claims less; \"unrelated\" means the translation misses the point)\n"
+        f'  "notes" — one or two sentences justifying the verdict'
+    )
+def _repair_prompt(
+    theorem: str, claim_statement: str, lean_code: str, diagnostic: str, category: str, context: dict,
+) -> str:
+    return (
+        f"You are repairing a rejected Lean 4 translation for a mathematical proof project.\n"
+        f"Theorem: {theorem}\n"
+        f"Claim statement: {claim_statement}\n"
+        f"Rejected Lean 4 code:\n{lean_code}\n"
+        f"Rejection category: {category}\n"
+        f"Diagnostic (compiler output or equivalence-review note): {diagnostic}\n"
+        f"Context: {json.dumps(context, indent=2)[:1500]}\n"
+        f"Either produce a corrected Lean 4 translation, or if the diagnostic reveals a\n"
+        f"genuine mathematical gap (not just a translation slip), say so honestly.\n"
+        f"Return ONLY a JSON object with exactly these keys:\n"
+        f'  "translatable" — true if you produced a corrected translation, false if the\n'
+        f"    diagnostic exposes a real mathematical gap rather than a fixable translation issue\n"
+        f'  "lean_code" — the corrected Lean 4 snippet; empty string if translatable is false\n'
+        f'  "lean_name" — a valid Lean identifier (snake_case); empty string if translatable is false\n'
+        f'  "explanation" — what was fixed, or what gap was exposed'
+    )
+
 
 
 def _load_local_env() -> None:
@@ -166,6 +250,31 @@ def _normalize_critique(result: dict) -> dict:
         result["status"] = "supported"
     return result
 
+def _normalize_formalization(result: dict) -> dict:
+    """Coerce an LLM formalization response into a well-formed translation draft."""
+    if not isinstance(result, dict) or "translatable" not in result:
+        return dict(FALLBACK_FORMALIZATION)
+    lean_code = result.get("lean_code", "")
+    lean_name = result.get("lean_name", "")
+    explanation = result.get("explanation", "")
+    return {
+        "translatable": bool(result.get("translatable")),
+        "lean_code": lean_code if isinstance(lean_code, str) else "",
+        "lean_name": lean_name if isinstance(lean_name, str) else "",
+        "explanation": explanation if isinstance(explanation, str) else "",
+    }
+
+
+def _normalize_equivalence(result: dict) -> dict:
+    """Coerce an LLM equivalence-review response into a well-formed verdict."""
+    if not isinstance(result, dict) or "relation" not in result:
+        return dict(FALLBACK_EQUIVALENCE)
+    relation = str(result.get("relation", "")).lower()
+    if relation not in {"equivalent", "stronger", "weaker", "unrelated"}:
+        relation = "unclear"
+    notes = result.get("notes", "")
+    return {"relation": relation, "notes": notes if isinstance(notes, str) else ""}
+
 
 # ---------------------------------------------------------------------------
 # LLM clients
@@ -185,6 +294,21 @@ class LLMClient(ABC):
         return _normalize_critique(
             self._respond(_critique_prompt(theorem, move_summary, claim_statement, context))
         )
+    def formalize(self, theorem: str, move_summary: str, claim_statement: str, context: dict) -> dict:
+         return _normalize_formalization(
+            self._respond(_formalize_prompt(theorem, move_summary, claim_statement, context))
+        )
+
+    def check_equivalence(self, claim_statement: str, lean_code: str) -> dict:
+        return _normalize_equivalence(self._respond(_equivalence_prompt(claim_statement, lean_code)))
+
+    def repair_formalization(
+        self, theorem: str, claim_statement: str, lean_code: str, diagnostic: str, category: str, context: dict,
+    ) -> dict:
+        return _normalize_formalization(
+            self._respond(_repair_prompt(theorem, claim_statement, lean_code, diagnostic, category, context))
+        )
+
 
     def _respond(self, prompt: str) -> dict:
         return _parse_json(self._call(prompt))
@@ -334,6 +458,140 @@ class Lean4Verifier(FormalVerifier):
 
 
 # ---------------------------------------------------------------------------
+# Formalizer agent 
+# ---------------------------------------------------------------------------
+
+def _lean_identifier(text: str) -> str:
+    """Turn an arbitrary string into a safe Lean 4 namespace/identifier fragment."""
+    cleaned = re.sub(r"[^0-9A-Za-z_]", "_", text).strip("_")
+    if not cleaned or not cleaned[0].isalpha():
+        cleaned = f"P_{cleaned}"
+    return cleaned
+
+
+def classify_lean_error(output: str, *, timed_out: bool = False) -> str:
+
+    if timed_out:
+        return "resource_timeout"
+    text = output.lower()
+    if "unknown identifier" in text or "unknown constant" in text or "unknown namespace" in text:
+       return "missing_definition_or_library_lemma"
+    if "type mismatch" in text or "failed to synthesize" in text:
+        return "elaboration_type_mismatch"
+    if "unsolved goals" in text or "tactic" in text and "failed" in text:
+        return "tactic_search_failure"
+    if "inconsistent" in text:
+        return "inconsistent_assumptions"
+    return "likely_mathematical_gap"
+
+
+class LeanChecker:
+    
+
+    def __init__(self, binary: str = "lean", timeout_seconds: int = 20):
+        self.binary = binary
+        self.timeout_seconds = timeout_seconds
+
+    def available(self) -> bool:
+        return shutil.which(self.binary) is not None
+
+    def check(
+        self,
+        lean_code: str,
+        *,
+        proof_id: str = "",
+        claim_id: str = "",
+        toolchain: str = "",
+        mathlib_revision: str = "",
+        deny_sorry: bool = True,
+    ) -> dict:
+        """
+        Returns a dict with: status, output (diagnostics), axioms_used, timing_seconds,
+        source_hash, error_category (only set on a genuine compiler failure).
+        """
+        source_hash = hashlib.sha256(lean_code.encode("utf-8")).hexdigest()[:16]
+        base_result = {
+            "proof_id": proof_id,
+            "claim_id": claim_id,
+            "toolchain": toolchain,
+            "mathlib_revision": mathlib_revision,
+            "source_hash": source_hash,
+            "axioms_used": [],
+            "timing_seconds": 0.0,
+            "error_category": "",
+        }
+        if not lean_code or not lean_code.strip():
+            return {**base_result, "status": "unavailable", "output": "No Lean code to check."}
+        if not self.available():
+            return {
+                **base_result,
+                "status": "unavailable",
+                "output": f"'{self.binary}' not found on PATH; skipping local type-check.",
+            }
+
+        declared_axioms = re.findall(r"\baxiom\s+([A-Za-z_][A-Za-z0-9_']*)", lean_code)
+        uses_sorry = bool(re.search(r"\bsorry\b", lean_code))
+
+        handle = tempfile.NamedTemporaryFile(suffix=".lean", mode="w", delete=False)
+        started = time.monotonic()
+        try:
+            handle.write(lean_code)
+            handle.close()
+            proc = subprocess.run(
+                [self.binary, handle.name],
+                capture_output=True, text=True, timeout=self.timeout_seconds,
+            )
+            elapsed = time.monotonic() - started
+            output = proc.stdout + proc.stderr
+            if proc.returncode != 0:
+                return {
+                    **base_result,
+                    "status": "failed",
+                    "output": output[-4000:],
+                    "timing_seconds": elapsed,
+                    "error_category": classify_lean_error(output),
+                }
+            uses_sorry = uses_sorry or "declaration uses 'sorry'" in output.lower()
+            if uses_sorry and deny_sorry:
+                return {
+                    **base_result,
+                    "status": "incomplete_sorry",
+                    "output": output[-4000:],
+                    "timing_seconds": elapsed,
+                    "axioms_used": ["sorryAx"],
+                }
+            if declared_axioms:
+                return {
+                    **base_result,
+                    "status": "untracked_axiom",
+                    "output": output[-4000:],
+                    "timing_seconds": elapsed,
+                    "axioms_used": declared_axioms,
+                }
+            return {
+                **base_result,
+                "status": "verified",
+                "output": output,
+                "timing_seconds": elapsed,
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                **base_result,
+                "status": "failed",
+                "output": "Lean check timed out.",
+                "timing_seconds": self.timeout_seconds,
+                "error_category": classify_lean_error("", timed_out=True),
+            }
+        except OSError as exc:  # pragma: no cover - defensive
+            return {**base_result, "status": "unavailable", "output": f"Lean check errored: {exc}"}
+        finally:
+            try:
+                os.unlink(handle.name)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # LangGraph workflow
 # ---------------------------------------------------------------------------
 
@@ -347,6 +605,8 @@ class WorkflowState(TypedDict, total=False):
     last_move_id: str
     current_attempt_id: str
     last_critique: str
+    last_critique_decision: str
+    last_lean_status: str
     proof_closed: bool
 
 
