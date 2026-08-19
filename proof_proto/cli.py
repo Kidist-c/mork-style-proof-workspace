@@ -35,6 +35,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         help="Model name for the selected provider",
     )
+    parser.add_argument(
+            "--toolchain",
+            default="",
+            help="Lean toolchain identifier to record on formalized claims (§11.2); "
+            "informational only unless a pinned lake project is wired in",
+        )
+    parser.add_argument(
+            "--mathlib-revision",
+            default="",
+            help="mathlib revision to record on formalized claims (§11.2); informational only",
+        )
     return parser
 
 
@@ -53,6 +64,8 @@ def main(argv: list[str] | None = None) -> int:
         root=str(root),
         llm_client=llm_client,
         max_iterations=args.max_iterations,
+        toolchain=args.toolchain,
+        mathlib_revision=args.mathlib_revision,
     )
 
     project = result["project"]
@@ -91,6 +104,20 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  Verdict : {a.get('evidence', 'pending — no verdict yet')}")
             print()
         print("=" * 60)
+        claims = project.graph.get_all_claims(project.proof_id)
+        lean_claims = [c for c in claims if c.get("formalization_status")]
+        if lean_claims:
+                print(f"  LEAN FORMALIZATIONS ({len(lean_claims)} total)")
+                print("-" * 60)
+                for c in lean_claims:
+                    print(f"  [{c['id']}]  formalization_status: {c['formalization_status']}")
+                    print(f"  Informal : {c['statement']}")
+                    if c.get("lean_name"):
+                         print(f"  Lean name: {c['lean_name']}  (namespace: {c.get('lean_namespace', '')})")
+                    if c.get("lean_statement_path"):
+                         print(f"  Lean file: {c['lean_statement_path']}")
+                    print()
+                print("=" * 60)
     finally:
         project.close()
 
