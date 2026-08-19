@@ -611,30 +611,39 @@ class WorkflowState(TypedDict, total=False):
 
 
 class ProofWorkflow:
-    """The explore/critique loop as a compiled LangGraph.
+    """The explore/critique/formalize loop as a compiled LangGraph.
 
-    init -> explore -> critique, looping back to explore until the critic stops
-    or the max iteration budget is exhausted.
+    init -> explore -> critique -> formalize, looping back to explore until the
+    critic says stop, the formalizer's Lean check closes the proof, or the max
+     iteration budget is exhausted..
     """
 
     def __init__(
         self,
         llm: Optional[LLMClient] = None,
         verifier: Optional[FormalVerifier] = None,
+        lean_checker: Optional[LeanChecker] = None,
+        toolchain: str = "",
+        mathlib_revision: str = "",
     ):
         self.llm = llm or OllamaLLMClient()
         self.verifier = verifier or FormalVerifier()
+        self.lean_checker = lean_checker or LeanChecker()
+        self.toolchain = toolchain
+        self.mathlib_revision = mathlib_revision
 
     def build(self):
         workflow = StateGraph(WorkflowState)
         workflow.add_node("init", self._init_state)
         workflow.add_node("explore", self._explore)
         workflow.add_node("critique", self._critique)
+        workflow.add_node("formalize", self._formalize)
         workflow.set_entry_point("init")
         workflow.add_edge("init", "explore")
         workflow.add_edge("explore", "critique")
+        workflow.add_edge("critique", "formalize")
         workflow.add_conditional_edges(
-            "critique", self._should_continue, {"continue": "explore", END: END}
+            "formalize", self._should_continue, {"continue": "explore", END: END}
         )
         return workflow.compile()
 
@@ -696,12 +705,138 @@ class ProofWorkflow:
             critique.get("reason", ""),
         )
         state["last_critique"] = critique.get("reason", "")
+        state["last_critique_decision"] = critique.get("decision", "continue")
+        return state
+    
+    def _formalize(self, state: WorkflowState) -> WorkflowState:
+        project: ProofProject = state["project"]
+        theorem = state["theorem"]
+        claim_statement = state.get("last_claim", "") or state["last_move"]
+        attempt_id = state["current_attempt_id"]
+        claim_id = f"claim-{attempt_id}"
+        context = project.context_for(ROOT_STATE_ID)
 
-        # Run the formal verifier against the full attempt chain.
+        draft = self.llm.formalize(theorem, state["last_move"], claim_statement, context)
+        state["last_lean_status"] = "not_translatable"
+
+        if not draft["translatable"] or not draft["lean_code"]:
+            project.add_claim(claim_id, claim_statement)
+            project.link_produced_claim(attempt_id, claim_id)
+            project.record_lean_formalization(
+                claim_id, formalization_status="not_translatable",
+                last_compiler_output=draft.get("explanation", ""),
+            )
+            return self._maybe_close(state)
+
+        lean_code = draft["lean_code"]
+        lean_name = draft["lean_name"] or _lean_identifier(claim_id)
+        namespace = f"Proof_{_lean_identifier(project.proof_id)}"
+
+        # as the informal claim, before we ever bother invoking Lean? -----------
+        review = self.llm.check_equivalence(claim_statement, lean_code)
+        relation_to_category = {
+            "stronger": "formal_statement_stronger_than_informal",
+            "weaker": "translation_ambiguity",
+            "unrelated": "translation_ambiguity",
+            "unclear": "translation_ambiguity",
+        }
+        equivalence_category = relation_to_category.get(review["relation"], "")
+
+        repaired_once = False
+        if equivalence_category:
+            repair = self.llm.repair_formalization(
+                theorem, claim_statement, lean_code, review["notes"], equivalence_category, context,
+            )
+            repaired_once = True
+            if repair["translatable"] and repair["lean_code"]:
+                lean_code = repair["lean_code"]
+                lean_name = repair["lean_name"] or lean_name
+                review = self.llm.check_equivalence(claim_statement, lean_code)
+                equivalence_category = relation_to_category.get(review["relation"], "")
+            else:
+                # Repair agent judged this a genuine mathematical gap, not a
+                # fixable translation slip — expose it rather than keep trying.
+                equivalence_category = "likely_mathematical_gap"
+
+        final_status = equivalence_category or "pending"
+        check: dict = {}
+        if not equivalence_category:
+            # built into LeanChecker itself 
+            check = self.lean_checker.check(
+                lean_code, proof_id=project.proof_id, claim_id=claim_id,
+                toolchain=self.toolchain, mathlib_revision=self.mathlib_revision,
+                deny_sorry=True,
+            )
+            final_status = check.get("status", "unavailable")
+
+            if final_status == "failed" and not repaired_once:
+                repair = self.llm.repair_formalization(
+                    theorem, claim_statement, lean_code, check.get("output", ""),
+                    check.get("error_category", ""), context,
+                )
+                if repair["translatable"] and repair["lean_code"]:
+                    lean_code = repair["lean_code"]
+                    lean_name = repair["lean_name"] or lean_name
+                    check = self.lean_checker.check(
+                        lean_code, proof_id=project.proof_id, claim_id=claim_id,
+                        toolchain=self.toolchain, mathlib_revision=self.mathlib_revision,
+                        deny_sorry=True,
+                    )
+                    final_status = check.get("status", "unavailable")
+
+        # --- commit source + log as artifacts 
+        source_artifact = project.write_artifact(
+            name=f"{attempt_id}-lean", content=lean_code, kind="lean_snippet", attempt_id=attempt_id,
+        )
+        if check.get("output"):
+            project.write_artifact(
+                name=f"{attempt_id}-lean-log", content=check["output"],
+                kind="lean_check_log", attempt_id=attempt_id,
+            )
+
+        # --- write the claim + its Lean metadata 
+        project.add_claim(claim_id, claim_statement)
+        project.link_produced_claim(attempt_id, claim_id)
+        project.record_lean_formalization(
+            claim_id, lean_name=lean_name, lean_statement_path=source_artifact["path"],
+            namespace=namespace, toolchain_hash=self.toolchain,
+            mathlib_revision=self.mathlib_revision, formalization_status=final_status,
+            last_compiler_output=check.get("output", review.get("notes", "")),
+        )
+
+        # --- record the verification 
+        project.add_verification(
+            attempt_id, claim_id, kind="lean", status=final_status, lean_name=lean_name,
+            toolchain_hash=self.toolchain, mathlib_revision=self.mathlib_revision,
+            error_category=check.get("error_category", equivalence_category),
+            axioms_used=check.get("axioms_used", []), timing_seconds=check.get("timing_seconds", 0.0),
+            source_hash=check.get("source_hash", ""),
+        )
+
+        # --- promote only on a genuine, clean pass 
+        if final_status == "verified":
+            project.update_claim_status(
+                claim_id, "lean_verified",
+                reason="Lean 4 kernel accepted a sorry-free, axiom-clean statement.",
+            )
+            project.mark_attempt(
+                attempt_id, "lean_verified", "Lean 4 kernel accepted the formalizer's translation.",
+            )
+
+        state["last_lean_status"] = final_status
+        return self._maybe_close(state)
+
+    def _maybe_close(self, state: WorkflowState) -> WorkflowState:
+        """Run the formal verifier now that the critic's verdict and any Lean check
+        are both recorded on the attempt, so a genuine Lean pass can close the
+        state exactly like a critic acceptance can (both are in FormalVerifier's
+        accepted_statuses).
+        """
+        project: ProofProject = state["project"]
         all_attempts = project.graph.get_attempts_for_state(ROOT_STATE_ID, project.proof_id)
         verdict = self.verifier.verify(state["theorem"], all_attempts)
-        if verdict["closed"] or critique.get("decision") == "stop":
-            project.close_state(ROOT_STATE_ID, verdict["reason"] or critique.get("reason", ""))
+        if verdict["closed"] or state.get("last_critique_decision") == "stop":
+            project.close_state(ROOT_STATE_ID, verdict["reason"] or state.get("last_critique", ""))
             state["proof_closed"] = True
         return state
 
@@ -723,8 +858,11 @@ class ProofWorkflow:
 def build_graph(
     llm_client: Optional[LLMClient] = None,
     verifier: Optional[FormalVerifier] = None,
+    lean_checker: Optional[LeanChecker] = None,
+    toolchain: str = "",
+    mathlib_revision: str = "",
 ):
-    return ProofWorkflow(llm_client, verifier).build()
+    return ProofWorkflow(llm_client, verifier, lean_checker, toolchain, mathlib_revision).build()
 
 
 def run_workflow(
@@ -732,9 +870,11 @@ def run_workflow(
     root: str,
     llm_client: Optional[LLMClient] = None,
     max_iterations: int = DEFAULT_ITERATIONS,
+    toolchain: str = "",
+    mathlib_revision: str = "",
 ) -> Dict[str, Any]:
-    """Run the LangGraph explore/critique workflow over the proof workspace."""
-    graph = build_graph(llm_client or make_llm_client())
+    """Run the LangGraph explore/critique/formalize workflow over the proof workspace."""
+    graph = build_graph(llm_client or make_llm_client(), toolchain=toolchain, mathlib_revision=mathlib_revision)
     project = ProofProject(root, theorem)
     if project.graph.get_state(ROOT_STATE_ID, project.proof_id) is None:
         project.add_state(ROOT_STATE_ID, "Initial theorem state")
