@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import sys
@@ -6,6 +7,37 @@ import unittest
 from pathlib import Path
 
 from proof_proto.langgraph_workflow import run_workflow
+
+
+def _write_fake_lean(directory: str, *, stdout: str = "", stderr: str = "", exit_code: int = 0) -> Path:
+    """Write a minimal fake `lean` executable for whichever OS the tests are
+    running on, so LeanChecker's subprocess.run([binary, file]) call succeeds
+    without an actual Lean toolchain installed. Windows can't execute a
+    `#!/bin/sh` script directly, so this writes a .bat file there instead of
+    a POSIX shell script.
+    """
+    if os.name == "nt":
+        path = Path(directory, "lean.bat")
+        lines = ["@echo off"]
+        if stdout:
+            lines.append(f"echo {stdout}")
+        if stderr:
+            lines.append(f"echo {stderr} 1>&2")
+        lines.append(f"exit /b {exit_code}")
+        path.write_text("\r\n".join(lines) + "\r\n")
+    else:
+        import stat
+
+        path = Path(directory, "lean")
+        lines = ["#!/bin/sh"]
+        if stdout:
+            lines.append(f'echo "{stdout}"')
+        if stderr:
+            lines.append(f'echo "{stderr}" >&2')
+        lines.append(f"exit {exit_code}")
+        path.write_text("\n".join(lines) + "\n")
+        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return path
 
 
 class DummyLLM:
@@ -22,22 +54,24 @@ class DummyLLM:
             "reason": "The parity split is a sensible next step",
             "status": "supported",
         }
+
     def formalize(self, theorem: str, move_summary: str, claim_statement: str, context: dict) -> dict:
-            return {
-                "translatable": True,
-                "lean_code": "theorem parity_split (n : Nat) : True := trivial",
-                "lean_name": "parity_split",
-                "explanation": "Statement stub only; case split left as future work.",
-            }
-    
+        return {
+            "translatable": True,
+            "lean_code": "theorem parity_split (n : Nat) : True := trivial",
+            "lean_name": "parity_split",
+            "explanation": "Statement stub only; case split left as future work.",
+        }
+
     def check_equivalence(self, claim_statement: str, lean_code: str) -> dict:
-            return {"relation": "equivalent", "notes": "Matches the informal claim."}
-    
+        return {"relation": "equivalent", "notes": "Matches the informal claim."}
+
     def repair_formalization(
-            self, theorem: str, claim_statement: str, lean_code: str, diagnostic: str, category: str, context: dict,
-        ) -> dict:
-            return {"translatable": False, "lean_code": "", "lean_name": "", "explanation": "no repair needed"}
-    
+        self, theorem: str, claim_statement: str, lean_code: str, diagnostic: str, category: str, context: dict,
+    ) -> dict:
+        return {"translatable": False, "lean_code": "", "lean_name": "", "explanation": "no repair needed"}
+
+
 class NotTranslatableLLM(DummyLLM):
     """Explorer/critic behave normally; formalizer declares the move untranslatable."""
 
@@ -48,6 +82,7 @@ class NotTranslatableLLM(DummyLLM):
             "lean_name": "",
             "explanation": "This move is a natural-language heuristic, not a formal statement.",
         }
+
 
 class MistranslatedThenRepairedLLM(DummyLLM):
     """First equivalence review says 'unrelated'; the repair call fixes it."""
@@ -79,9 +114,10 @@ class MistranslatedThenRepairedLLM(DummyLLM):
             "explanation": "repaired to match the claim",
         }
 
+
 class LangGraphWorkflowTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp_dir = tempfile.mkdtemp(prefix="langgraph-proof-", dir="/tmp")
+        self.temp_dir = tempfile.mkdtemp(prefix="langgraph-proof-")
 
     def tearDown(self) -> None:
         result = getattr(self, "_result", None)
@@ -143,6 +179,7 @@ class LangGraphWorkflowTests(unittest.TestCase):
 
     def test_formalizer_promotes_to_lean_verified_on_clean_pass(self) -> None:
         
+        
         self._result = run_workflow(
             theorem="For all n, n^2 + n is even",
             root=self.temp_dir,
@@ -186,7 +223,9 @@ class LangGraphWorkflowTests(unittest.TestCase):
         self.assertEqual(attempts[0]["status"], "supported")
 
     def test_formalizer_repairs_a_mistranslated_draft(self) -> None:
-        
+        """§11.3: equivalence review catches a mistranslation before Lean is ever
+        invoked, and one repair attempt is allowed to fix it.
+        """
         self._result = run_workflow(
             theorem="For all n, n^2 + n is even",
             root=self.temp_dir,
@@ -223,14 +262,13 @@ class LeanCheckerTests(unittest.TestCase):
         self.assertEqual(result["status"], "unavailable")
 
     def test_rejects_sorry_even_on_clean_exit(self) -> None:
-        
-        import stat
+        """§11.3: 'production verification must reject sorry' — a fake `lean` binary
+        that exits 0 but warns about `sorry` must NOT be reported as verified.
+        """
         from proof_proto.langgraph_workflow import LeanChecker
 
-        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-", dir="/tmp")
-        fake_lean = Path(fake_bin_dir, "lean")
-        fake_lean.write_text("#!/bin/sh\necho \"warning: declaration uses 'sorry'\"\nexit 0\n")
-        fake_lean.chmod(fake_lean.stat().st_mode | stat.S_IEXEC)
+        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-")
+        fake_lean = _write_fake_lean(fake_bin_dir, stdout="warning: declaration uses 'sorry'")
         try:
             checker = LeanChecker(binary=str(fake_lean))
             result = checker.check("theorem t : True := by sorry")
@@ -240,13 +278,10 @@ class LeanCheckerTests(unittest.TestCase):
             shutil.rmtree(fake_bin_dir)
 
     def test_rejects_untracked_axiom_even_on_clean_exit(self) -> None:
-        import stat
         from proof_proto.langgraph_workflow import LeanChecker
 
-        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-", dir="/tmp")
-        fake_lean = Path(fake_bin_dir, "lean")
-        fake_lean.write_text("#!/bin/sh\nexit 0\n")
-        fake_lean.chmod(fake_lean.stat().st_mode | stat.S_IEXEC)
+        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-")
+        fake_lean = _write_fake_lean(fake_bin_dir)
         try:
             checker = LeanChecker(binary=str(fake_lean))
             result = checker.check("axiom foo : True\ntheorem t : True := foo")
@@ -256,13 +291,10 @@ class LeanCheckerTests(unittest.TestCase):
             shutil.rmtree(fake_bin_dir)
 
     def test_reports_verified_on_genuinely_clean_code(self) -> None:
-        import stat
         from proof_proto.langgraph_workflow import LeanChecker
 
-        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-", dir="/tmp")
-        fake_lean = Path(fake_bin_dir, "lean")
-        fake_lean.write_text("#!/bin/sh\nexit 0\n")
-        fake_lean.chmod(fake_lean.stat().st_mode | stat.S_IEXEC)
+        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-")
+        fake_lean = _write_fake_lean(fake_bin_dir)
         try:
             checker = LeanChecker(binary=str(fake_lean))
             result = checker.check("theorem t : True := trivial")
@@ -271,13 +303,10 @@ class LeanCheckerTests(unittest.TestCase):
             shutil.rmtree(fake_bin_dir)
 
     def test_reports_failed_with_error_category_on_nonzero_exit(self) -> None:
-        import stat
         from proof_proto.langgraph_workflow import LeanChecker
 
-        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-", dir="/tmp")
-        fake_lean = Path(fake_bin_dir, "lean")
-        fake_lean.write_text("#!/bin/sh\necho 'error: unknown identifier foo' >&2\nexit 1\n")
-        fake_lean.chmod(fake_lean.stat().st_mode | stat.S_IEXEC)
+        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-")
+        fake_lean = _write_fake_lean(fake_bin_dir, stderr="error: unknown identifier foo", exit_code=1)
         try:
             checker = LeanChecker(binary=str(fake_lean))
             result = checker.check("theorem t : True := foo")
@@ -360,6 +389,7 @@ class FormalizationNormalizationTests(unittest.TestCase):
 
         self.assertEqual(_lean_identifier("my-proof.v2"), "my_proof_v2")
         self.assertEqual(_lean_identifier("123start"), "P_123start")
+
 
 if __name__ == "__main__":
     unittest.main()
