@@ -23,6 +23,65 @@ class DummyLLM:
             "status": "supported",
         }
 
+    def formalize(self, theorem: str, move_summary: str, claim_statement: str, context: dict) -> dict:
+        return {
+            "translatable": True,
+            "lean_code": "theorem parity_split (n : Nat) : True := trivial",
+            "lean_name": "parity_split",
+            "explanation": "Statement stub only; case split left as future work.",
+        }
+
+    def check_equivalence(self, claim_statement: str, lean_code: str) -> dict:
+        return {"relation": "equivalent", "notes": "Matches the informal claim."}
+
+    def repair_formalization(
+        self, theorem: str, claim_statement: str, lean_code: str, diagnostic: str, category: str, context: dict,
+    ) -> dict:
+        return {"translatable": False, "lean_code": "", "lean_name": "", "explanation": "no repair needed"}
+
+
+class NotTranslatableLLM(DummyLLM):
+    """Explorer/critic behave normally; formalizer declares the move untranslatable."""
+
+    def formalize(self, theorem: str, move_summary: str, claim_statement: str, context: dict) -> dict:
+        return {
+            "translatable": False,
+            "lean_code": "",
+            "lean_name": "",
+            "explanation": "This move is a natural-language heuristic, not a formal statement.",
+        }
+
+
+class MistranslatedThenRepairedLLM(DummyLLM):
+    """First equivalence review says 'unrelated'; the repair call fixes it."""
+
+    def __init__(self) -> None:
+        self._reviewed_once = False
+
+    def formalize(self, theorem: str, move_summary: str, claim_statement: str, context: dict) -> dict:
+        return {
+            "translatable": True,
+            "lean_code": "theorem wrong_statement : 1 = 2 := sorry",
+            "lean_name": "wrong_statement",
+            "explanation": "first (bad) draft",
+        }
+
+    def check_equivalence(self, claim_statement: str, lean_code: str) -> dict:
+        if not self._reviewed_once:
+            self._reviewed_once = True
+            return {"relation": "unrelated", "notes": "Does not mention parity at all."}
+        return {"relation": "equivalent", "notes": "Now matches after repair."}
+
+    def repair_formalization(
+        self, theorem: str, claim_statement: str, lean_code: str, diagnostic: str, category: str, context: dict,
+    ) -> dict:
+        return {
+            "translatable": True,
+            "lean_code": "theorem parity_split_fixed (n : Nat) : True := trivial",
+            "lean_name": "parity_split_fixed",
+            "explanation": "repaired to match the claim",
+        }
+
 
 class LangGraphWorkflowTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -85,6 +144,222 @@ class LangGraphWorkflowTests(unittest.TestCase):
         root_state = result["project"].graph.get_state("root", result["project"].proof_id)
         self.assertEqual(root_state["status"], "open")
         self.assertTrue(Path(self.temp_dir, "journal.jsonl").exists())
+
+    def test_formalizer_promotes_to_lean_verified_on_clean_pass(self) -> None:
+        self._result = run_workflow(
+            theorem="For all n, n^2 + n is even",
+            root=self.temp_dir,
+            llm_client=DummyLLM(),
+            max_iterations=1,
+        )
+        project = self._result["project"]
+
+        attempts = project.graph.get_attempts_for_state("root", project.proof_id)
+        self.assertGreaterEqual(len(attempts), 1)
+        attempt_id = attempts[0]["id"]
+        claim_id = f"claim-{attempt_id}"
+
+        claims = project.graph.get_all_claims(project.proof_id)
+        claim = next(c for c in claims if c["id"] == claim_id)
+        self.assertEqual(claim["lean_name"], "parity_split")
+        self.assertTrue(claim["lean_statement_path"])
+        self.assertIn(claim["formalization_status"], {"verified", "unavailable"})
+
+        artifact_dir = Path(self.temp_dir, "artifacts")
+        lean_files = list(artifact_dir.glob("*lean*"))
+        self.assertTrue(lean_files, "expected a lean snippet artifact on disk")
+
+    def test_formalizer_skips_lean_when_not_translatable(self) -> None:
+        self._result = run_workflow(
+            theorem="For all n, n^2 + n is even",
+            root=self.temp_dir,
+            llm_client=NotTranslatableLLM(),
+            max_iterations=1,
+        )
+        project = self._result["project"]
+        attempts = project.graph.get_attempts_for_state("root", project.proof_id)
+        attempt_id = attempts[0]["id"]
+        claim_id = f"claim-{attempt_id}"
+
+        claims = project.graph.get_all_claims(project.proof_id)
+        claim = next(c for c in claims if c["id"] == claim_id)
+        self.assertEqual(claim["formalization_status"], "not_translatable")
+        # Critic's own verdict on the attempt should be untouched by the skip.
+        self.assertEqual(attempts[0]["status"], "supported")
+
+    def test_formalizer_repairs_a_mistranslated_draft(self) -> None:
+        self._result = run_workflow(
+            theorem="For all n, n^2 + n is even",
+            root=self.temp_dir,
+            llm_client=MistranslatedThenRepairedLLM(),
+            max_iterations=1,
+        )
+        project = self._result["project"]
+        attempts = project.graph.get_attempts_for_state("root", project.proof_id)
+        attempt_id = attempts[0]["id"]
+        claim_id = f"claim-{attempt_id}"
+
+        claims = project.graph.get_all_claims(project.proof_id)
+        claim = next(c for c in claims if c["id"] == claim_id)
+        # After repair, the lean_name should be the *repaired* draft's name, not
+        # the original mistranslation's.
+        self.assertEqual(claim["lean_name"], "parity_split_fixed")
+
+
+class LeanCheckerTests(unittest.TestCase):
+    """Pure unit tests for the local Lean checker — no Neo4j required."""
+
+    def test_unavailable_without_toolchain(self) -> None:
+        from proof_proto.langgraph_workflow import LeanChecker
+
+        checker = LeanChecker(binary="definitely-not-a-real-lean-binary")
+        result = checker.check("theorem t : True := trivial")
+        self.assertEqual(result["status"], "unavailable")
+
+    def test_unavailable_for_empty_code(self) -> None:
+        from proof_proto.langgraph_workflow import LeanChecker
+
+        checker = LeanChecker()
+        result = checker.check("")
+        self.assertEqual(result["status"], "unavailable")
+
+    def test_rejects_sorry_even_on_clean_exit(self) -> None:
+        import stat
+        from proof_proto.langgraph_workflow import LeanChecker
+
+        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-", dir="/tmp")
+        fake_lean = Path(fake_bin_dir, "lean")
+        fake_lean.write_text("#!/bin/sh\necho \"warning: declaration uses 'sorry'\"\nexit 0\n")
+        fake_lean.chmod(fake_lean.stat().st_mode | stat.S_IEXEC)
+        try:
+            checker = LeanChecker(binary=str(fake_lean))
+            result = checker.check("theorem t : True := by sorry")
+            self.assertEqual(result["status"], "incomplete_sorry")
+            self.assertIn("sorryAx", result["axioms_used"])
+        finally:
+            shutil.rmtree(fake_bin_dir)
+
+    def test_rejects_untracked_axiom_even_on_clean_exit(self) -> None:
+        import stat
+        from proof_proto.langgraph_workflow import LeanChecker
+
+        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-", dir="/tmp")
+        fake_lean = Path(fake_bin_dir, "lean")
+        fake_lean.write_text("#!/bin/sh\nexit 0\n")
+        fake_lean.chmod(fake_lean.stat().st_mode | stat.S_IEXEC)
+        try:
+            checker = LeanChecker(binary=str(fake_lean))
+            result = checker.check("axiom foo : True\ntheorem t : True := foo")
+            self.assertEqual(result["status"], "untracked_axiom")
+            self.assertIn("foo", result["axioms_used"])
+        finally:
+            shutil.rmtree(fake_bin_dir)
+
+    def test_reports_verified_on_genuinely_clean_code(self) -> None:
+        import stat
+        from proof_proto.langgraph_workflow import LeanChecker
+
+        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-", dir="/tmp")
+        fake_lean = Path(fake_bin_dir, "lean")
+        fake_lean.write_text("#!/bin/sh\nexit 0\n")
+        fake_lean.chmod(fake_lean.stat().st_mode | stat.S_IEXEC)
+        try:
+            checker = LeanChecker(binary=str(fake_lean))
+            result = checker.check("theorem t : True := trivial")
+            self.assertEqual(result["status"], "verified")
+        finally:
+            shutil.rmtree(fake_bin_dir)
+
+    def test_reports_failed_with_error_category_on_nonzero_exit(self) -> None:
+        import stat
+        from proof_proto.langgraph_workflow import LeanChecker
+
+        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-", dir="/tmp")
+        fake_lean = Path(fake_bin_dir, "lean")
+        fake_lean.write_text("#!/bin/sh\necho 'error: unknown identifier foo' >&2\nexit 1\n")
+        fake_lean.chmod(fake_lean.stat().st_mode | stat.S_IEXEC)
+        try:
+            checker = LeanChecker(binary=str(fake_lean))
+            result = checker.check("theorem t : True := foo")
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["error_category"], "missing_definition_or_library_lemma")
+        finally:
+            shutil.rmtree(fake_bin_dir)
+
+
+class ErrorClassificationTests(unittest.TestCase):
+    """Pure unit tests for §11.4's error classifier."""
+
+    def test_timeout_classified_as_resource_timeout(self) -> None:
+        from proof_proto.langgraph_workflow import classify_lean_error
+
+        self.assertEqual(classify_lean_error("", timed_out=True), "resource_timeout")
+
+    def test_unknown_identifier_classified_as_missing_definition(self) -> None:
+        from proof_proto.langgraph_workflow import classify_lean_error
+
+        self.assertEqual(
+            classify_lean_error("error: unknown identifier 'foo'"),
+            "missing_definition_or_library_lemma",
+        )
+
+    def test_type_mismatch_classified_as_elaboration_mismatch(self) -> None:
+        from proof_proto.langgraph_workflow import classify_lean_error
+
+        self.assertEqual(classify_lean_error("type mismatch at foo"), "elaboration_type_mismatch")
+
+    def test_unclassified_falls_back_to_likely_mathematical_gap(self) -> None:
+        from proof_proto.langgraph_workflow import classify_lean_error
+
+        self.assertEqual(classify_lean_error("something unexpected happened"), "likely_mathematical_gap")
+
+
+class FormalizationNormalizationTests(unittest.TestCase):
+    """Pure unit tests for parsing/normalizing the formalizer's LLM output."""
+
+    def test_normalizes_well_formed_formalization(self) -> None:
+        from proof_proto.langgraph_workflow import _normalize_formalization
+
+        result = _normalize_formalization(
+            {"translatable": True, "lean_code": "theorem t : True := trivial", "lean_name": "t", "explanation": "x"}
+        )
+        self.assertTrue(result["translatable"])
+        self.assertEqual(result["lean_code"], "theorem t : True := trivial")
+
+    def test_formalization_falls_back_on_missing_key(self) -> None:
+        from proof_proto.langgraph_workflow import FALLBACK_FORMALIZATION, _normalize_formalization
+
+        self.assertEqual(_normalize_formalization({}), FALLBACK_FORMALIZATION)
+
+    def test_formalization_coerces_non_string_fields(self) -> None:
+        from proof_proto.langgraph_workflow import _normalize_formalization
+
+        result = _normalize_formalization({"translatable": True, "lean_code": 42, "lean_name": None})
+        self.assertEqual(result["lean_code"], "")
+        self.assertEqual(result["lean_name"], "")
+
+    def test_normalizes_equivalence_relation(self) -> None:
+        from proof_proto.langgraph_workflow import _normalize_equivalence
+
+        result = _normalize_equivalence({"relation": "STRONGER", "notes": "overclaims"})
+        self.assertEqual(result["relation"], "stronger")
+
+    def test_equivalence_falls_back_on_missing_key(self) -> None:
+        from proof_proto.langgraph_workflow import FALLBACK_EQUIVALENCE, _normalize_equivalence
+
+        self.assertEqual(_normalize_equivalence({}), FALLBACK_EQUIVALENCE)
+
+    def test_equivalence_unknown_relation_becomes_unclear(self) -> None:
+        from proof_proto.langgraph_workflow import _normalize_equivalence
+
+        result = _normalize_equivalence({"relation": "sideways", "notes": "?"})
+        self.assertEqual(result["relation"], "unclear")
+
+    def test_lean_identifier_sanitizes_arbitrary_text(self) -> None:
+        from proof_proto.langgraph_workflow import _lean_identifier
+
+        self.assertEqual(_lean_identifier("my-proof.v2"), "my_proof_v2")
+        self.assertEqual(_lean_identifier("123start"), "P_123start")
 
 
 if __name__ == "__main__":

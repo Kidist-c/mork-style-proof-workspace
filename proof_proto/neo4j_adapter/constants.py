@@ -10,7 +10,8 @@ CLAIM_STATUSES = {
     "conjectural", "empirical", "provisional", "critic_accepted",
     "lean_verified", "refuted", "retracted", "stale",
 }
-ATTEMPT_STATUSES = {"pending", "supported", "critic_accepted", "refuted", "retracted"}
+ATTEMPT_STATUSES = {"conjectural", "pending", "supported", "critic_accepted",
+                     "lean_verified", "refuted", "retracted"}
 
 
 def _check(value: str, allowed: Set[str], label: str) -> None:
