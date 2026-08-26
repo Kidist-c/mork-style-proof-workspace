@@ -531,15 +531,15 @@ class LeanChecker:
         declared_axioms = re.findall(r"\baxiom\s+([A-Za-z_][A-Za-z0-9_']*)", lean_code)
         uses_sorry = bool(re.search(r"\bsorry\b", lean_code))
 
-        handle = tempfile.NamedTemporaryFile(suffix=".lean", mode="w", delete=False)
+        handle =  tempfile.NamedTemporaryFile(suffix=".lean", mode="w", delete=False, encoding="utf-8")
         started = time.monotonic()
         try:
             handle.write(lean_code)
             handle.close()
             proc = subprocess.run(
-                [self.binary, handle.name],
-                capture_output=True, text=True, timeout=self.timeout_seconds,
-            )
+    [self.binary, handle.name],
+    capture_output=True, text=True, encoding="utf-8", timeout=self.timeout_seconds,
+)
             elapsed = time.monotonic() - started
             output = proc.stdout + proc.stderr
             if proc.returncode != 0:
