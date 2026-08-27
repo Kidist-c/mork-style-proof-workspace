@@ -486,13 +486,55 @@ def classify_lean_error(output: str, *, timed_out: bool = False) -> str:
 
 
 class LeanChecker:
-    
-    def __init__(self, binary: str = "lean", timeout_seconds: int = 20):
+
+    def __init__(
+        self,
+        binary: str = "lean",
+        timeout_seconds: int = 20,
+        use_lake: bool = False,
+        lake_project_dir: str = "",
+    ):
         self.binary = binary
         self.timeout_seconds = timeout_seconds
+        self.use_lake = use_lake
+        self.lake_project_dir = lake_project_dir
+        self._toolchain_cache: str = ""
+        self._mathlib_revision_cache: str = ""
 
     def available(self) -> bool:
+        if self.use_lake:
+            return shutil.which("lake") is not None
         return shutil.which(self.binary) is not None
+
+    def _resolve_toolchain(self) -> str:
+        if not self._toolchain_cache:
+            try:
+                command = (
+                    ["lake", "env", self.binary, "--version"]
+                    if self.use_lake else [self.binary, "--version"]
+                )
+                proc = subprocess.run(
+                    command, cwd=self.lake_project_dir or None,
+                    capture_output=True, text=True, encoding="utf-8", timeout=10,
+                )
+                self._toolchain_cache = (proc.stdout or proc.stderr).strip()
+            except Exception:
+                self._toolchain_cache = ""
+        return self._toolchain_cache
+
+    def _resolve_mathlib_revision(self) -> str:
+        if not self._mathlib_revision_cache and self.lake_project_dir:
+            mathlib_dir = os.path.join(self.lake_project_dir, ".lake", "packages", "mathlib")
+            try:
+                proc = subprocess.run(
+                    ["git", "-C", mathlib_dir, "rev-parse", "HEAD"],
+                    capture_output=True, text=True, encoding="utf-8", timeout=10,
+                )
+                if proc.returncode == 0:
+                    self._mathlib_revision_cache = proc.stdout.strip()
+            except Exception:
+                pass
+        return self._mathlib_revision_cache
 
     def check(
         self,
@@ -508,6 +550,11 @@ class LeanChecker:
         Returns a dict with: status, output (diagnostics), axioms_used, timing_seconds,
         source_hash, error_category (only set on a genuine compiler failure).
         """
+        toolchain = toolchain or self._resolve_toolchain()
+        mathlib_revision = mathlib_revision or (
+            self._resolve_mathlib_revision() if self.use_lake else ""
+        )
+
         source_hash = hashlib.sha256(lean_code.encode("utf-8")).hexdigest()[:16]
         base_result = {
             "proof_id": proof_id,
@@ -531,15 +578,20 @@ class LeanChecker:
         declared_axioms = re.findall(r"\baxiom\s+([A-Za-z_][A-Za-z0-9_']*)", lean_code)
         uses_sorry = bool(re.search(r"\bsorry\b", lean_code))
 
-        handle =  tempfile.NamedTemporaryFile(suffix=".lean", mode="w", delete=False, encoding="utf-8")
+        handle = tempfile.NamedTemporaryFile(suffix=".lean", mode="w", delete=False, encoding="utf-8")
         started = time.monotonic()
         try:
             handle.write(lean_code)
             handle.close()
+
+            command = (
+                ["lake", "env", self.binary, handle.name]
+                if self.use_lake else [self.binary, handle.name]
+            )
             proc = subprocess.run(
-    [self.binary, handle.name],
-    capture_output=True, text=True, encoding="utf-8", timeout=self.timeout_seconds,
-)
+                command, cwd=self.lake_project_dir or None,
+                capture_output=True, text=True, encoding="utf-8", timeout=self.timeout_seconds,
+            )
             elapsed = time.monotonic() - started
             output = proc.stdout + proc.stderr
             if proc.returncode != 0:
@@ -567,12 +619,7 @@ class LeanChecker:
                     "timing_seconds": elapsed,
                     "axioms_used": declared_axioms,
                 }
-            return {
-                **base_result,
-                "status": "verified",
-                "output": output,
-                "timing_seconds": elapsed,
-            }
+            return {**base_result, "status": "verified", "output": output, "timing_seconds": elapsed}
         except subprocess.TimeoutExpired:
             return {
                 **base_result,
@@ -581,15 +628,14 @@ class LeanChecker:
                 "timing_seconds": self.timeout_seconds,
                 "error_category": classify_lean_error("", timed_out=True),
             }
-        except OSError as exc:  # pragma: no cover - defensive
+        except OSError as exc:
             return {**base_result, "status": "unavailable", "output": f"Lean check errored: {exc}"}
         finally:
             try:
                 os.unlink(handle.name)
             except OSError:
                 pass
-
-
+                
 # ---------------------------------------------------------------------------
 # LangGraph workflow
 # ---------------------------------------------------------------------------
