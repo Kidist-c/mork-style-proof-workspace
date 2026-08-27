@@ -78,6 +78,22 @@ LEAN_ERROR_CATEGORIES = (
     "inconsistent_assumptions",
     "likely_mathematical_gap",
    "formal_statement_stronger_than_informal",
+   "stale_or_moved_mathlib_module",
+   "missing_mathlib_dependency"
+)
+
+MATHLIB_GUIDANCE = (
+    "\nMathlib-specific rules for this environment:\n"
+    "- Never write `import Mathlib` alone. Import the narrowest specific module\n"
+    "  you actually need (e.g. `import Mathlib.Algebra.Ring.Parity`, not the whole\n"
+    "  library) — bare `import Mathlib` takes several minutes to load.\n"
+    "- Mathlib reorganizes module paths and renames declarations frequently.\n"
+    "  If your proof fails with 'bad import' or 'unknown identifier'/'unknown\n"
+    "  constant', this is very likely a stale name or moved module, not\n"
+    "  necessarily wrong mathematics.\n"
+    "- Never declare a variable, binder, or hypothesis using the same name as a\n"
+    "  built-in type notation (ℕ, ℤ, ℝ, ℚ, etc.) — this silently shadows the real\n"
+    "  type and produces confusing, unrelated-looking errors.\n"
 )
 
 
@@ -124,6 +140,7 @@ def _formalize_prompt(theorem: str, move_summary: str, claim_statement: str, con
         f"Move summary: {move_summary}\n"
         f"Claim statement (the exact proposition to formalize): {claim_statement}\n"
         f"Context: {json.dumps(context, indent=2)[:2000]}\n"
+        f"{MATHLIB_GUIDANCE}\n"
         f"Return ONLY a JSON object with exactly these keys:\n"
         f'  "translatable" — true or false: can this claim be meaningfully stated\n'
         f"    in Lean 4 right now (even with `sorry` in the proof body)?\n"
@@ -161,6 +178,7 @@ def _repair_prompt(
         f"Rejection category: {category}\n"
         f"Diagnostic (compiler output or equivalence-review note): {diagnostic}\n"
         f"Context: {json.dumps(context, indent=2)[:1500]}\n"
+        f"{MATHLIB_GUIDANCE}\n"
         f"Either produce a corrected Lean 4 translation, or if the diagnostic reveals a\n"
         f"genuine mathematical gap (not just a translation slip), say so honestly.\n"
         f"Return ONLY a JSON object with exactly these keys:\n"
