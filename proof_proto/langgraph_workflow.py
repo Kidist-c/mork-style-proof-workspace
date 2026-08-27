@@ -635,7 +635,7 @@ class LeanChecker:
                 os.unlink(handle.name)
             except OSError:
                 pass
-                
+
 # ---------------------------------------------------------------------------
 # LangGraph workflow
 # ---------------------------------------------------------------------------
@@ -917,9 +917,11 @@ def run_workflow(
     max_iterations: int = DEFAULT_ITERATIONS,
     toolchain: str = "",
     mathlib_revision: str = "",
+    lean_checker: Optional[LeanChecker] = None
 ) -> Dict[str, Any]:
     """Run the LangGraph explore/critique/formalize workflow over the proof workspace."""
-    graph = build_graph(llm_client or make_llm_client(), toolchain=toolchain, mathlib_revision=mathlib_revision)
+    graph = build_graph(llm_client or make_llm_client(), toolchain=toolchain, 
+                        mathlib_revision=mathlib_revision,lean_checker=lean_checker)
     project = ProofProject(root, theorem)
     if project.graph.get_state(ROOT_STATE_ID, project.proof_id) is None:
         project.add_state(ROOT_STATE_ID, "Initial theorem state")
