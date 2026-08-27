@@ -492,8 +492,12 @@ def classify_lean_error(output: str, *, timed_out: bool = False) -> str:
     if timed_out:
         return "resource_timeout"
     text = output.lower()
+    if "unknown module prefix" in text or ("no directory" in text and ".olean" in text):
+        return "missing_mathlib_dependency"
+    if "bad import" in text:
+        return "stale_or_moved_mathlib_module"
     if "unknown identifier" in text or "unknown constant" in text or "unknown namespace" in text:
-       return "missing_definition_or_library_lemma"
+        return "missing_definition_or_library_lemma"
     if "type mismatch" in text or "failed to synthesize" in text:
         return "elaboration_type_mismatch"
     if "unsolved goals" in text or "tactic" in text and "failed" in text:
