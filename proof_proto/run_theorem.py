@@ -87,7 +87,7 @@ def main() -> None:
         lean_checker = LeanChecker(
         use_lake=True,
         lake_project_dir=str(args.lake_project.resolve()),
-        timeout_seconds=150,  # Mathlib-backed checks are much slower than bare lean
+        timeout_seconds=120,  # Mathlib-backed checks are much slower than bare lean
     )
         print(f"lean checker: lake env lean (project: {args.lake_project})\n")
     
