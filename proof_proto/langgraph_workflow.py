@@ -826,61 +826,28 @@ class ProofWorkflow:
         lean_name = draft["lean_name"] or _lean_identifier(claim_id)
         namespace = f"Proof_{_lean_identifier(project.proof_id)}"
 
-        # as the informal claim, before we ever bother invoking Lean? -----------
-        review = self.llm.check_equivalence(theorem,claim_statement, lean_code)
-        relation_to_category = {
-            "stronger": "formal_statement_stronger_than_informal",
-            "weaker": "translation_ambiguity",
-            "unrelated": "translation_ambiguity",
-            "unclear": "translation_ambiguity",
-        }
-        equivalence_category = relation_to_category.get(review["relation"], "")
+        # Lean runs first -- it is authoritative. Equivalence review only
+        # sanity-checks a genuine pass against the original claim.
+        final_status, check, review = self._lean_check_and_review(
+            theorem, claim_statement, lean_code, project, claim_id,
+        )
 
-        repaired_once = False
-        if equivalence_category:
+        if final_status != "verified":
+            diagnostic = check.get("output") or review.get("notes", "")
+            category = check.get("error_category") or final_status
             repair = self.llm.repair_formalization(
-                theorem, claim_statement, lean_code, review["notes"], equivalence_category, context,
+                theorem, claim_statement, lean_code, diagnostic, category, context,
             )
-            repaired_once = True
             if repair["translatable"] and repair["lean_code"]:
                 lean_code = repair["lean_code"]
                 lean_name = repair["lean_name"] or lean_name
-                review = self.llm.check_equivalence(theorem,claim_statement, lean_code)
-                if review["relation"] == "stronger":
-                    equivalence_category = "formal_statement_stronger_than_informal"
-                else:
-                    equivalence_category = ""
+                final_status, check, review = self._lean_check_and_review(
+                    theorem, claim_statement, lean_code, project, claim_id,
+                )
             else:
                 # Repair agent judged this a genuine mathematical gap, not a
                 # fixable translation slip — expose it rather than keep trying.
-                equivalence_category = "likely_mathematical_gap"
-
-        final_status = equivalence_category or "pending"
-        check: dict = {}
-        if not equivalence_category:
-            # built into LeanChecker itself 
-            check = self.lean_checker.check(
-                lean_code, proof_id=project.proof_id, claim_id=claim_id,
-                toolchain=self.toolchain, mathlib_revision=self.mathlib_revision,
-                deny_sorry=True,
-            )
-            final_status = check.get("status", "unavailable")
-
-            if final_status == "failed" and not repaired_once:
-                repair = self.llm.repair_formalization(
-                    theorem, claim_statement, lean_code, check.get("output", ""),
-                    check.get("error_category", ""), context,
-                )
-                if repair["translatable"] and repair["lean_code"]:
-                    lean_code = repair["lean_code"]
-                    lean_name = repair["lean_name"] or lean_name
-                    check = self.lean_checker.check(
-                        lean_code, proof_id=project.proof_id, claim_id=claim_id,
-                        toolchain=self.toolchain, mathlib_revision=self.mathlib_revision,
-                        deny_sorry=True,
-                    )
-                    final_status = check.get("status", "unavailable")
-        
+                final_status = "likely_mathematical_gap"
 
         # --- commit source + log as artifacts 
         source_artifact = project.write_artifact(
@@ -909,7 +876,7 @@ class ProofWorkflow:
         project.add_verification(
             attempt_id, claim_id, kind="lean", status=final_status, lean_name=lean_name,
             toolchain_hash=resolved_toolchain, mathlib_revision=resolved_mathlib_revision,
-            error_category=check.get("error_category", equivalence_category),
+            error_category=check.get("error_category", ""),
             axioms_used=check.get("axioms_used", []), timing_seconds=check.get("timing_seconds", 0.0),
             source_hash=check.get("source_hash", ""),
         )
@@ -926,21 +893,7 @@ class ProofWorkflow:
 
         state["last_lean_status"] = final_status
         return self._maybe_close(state)
-
-    def _maybe_close(self, state: WorkflowState) -> WorkflowState:
-        """Run the formal verifier now that the critic's verdict and any Lean check
-        are both recorded on the attempt, so a genuine Lean pass can close the
-        state exactly like a critic acceptance can (both are in FormalVerifier's
-        accepted_statuses).
-        """
-        project: ProofProject = state["project"]
-        all_attempts = project.graph.get_attempts_for_state(ROOT_STATE_ID, project.proof_id)
-        verdict = self.verifier.verify(state["theorem"], all_attempts)
-        if verdict["closed"] or state.get("last_critique_decision") == "stop":
-            project.close_state(ROOT_STATE_ID, verdict["reason"] or state.get("last_critique", ""))
-            state["proof_closed"] = True
-        return state
-
+    
     # --- routing ----------------------------------------------------------
 
     @staticmethod
