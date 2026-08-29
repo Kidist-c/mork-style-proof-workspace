@@ -76,6 +76,8 @@ LEAN_ERROR_CATEGORIES = (
     "inconsistent_assumptions",
     "likely_mathematical_gap",
    "formal_statement_stronger_than_informal",
+   "missing_mathlib_dependency",
+   "stale_or_moved_mathlib_module"
 )
 
 MATHLIB_GUIDANCE = (
@@ -490,18 +492,15 @@ def classify_lean_error(output: str, *, timed_out: bool = False) -> str:
     if timed_out:
         return "resource_timeout"
     text = output.lower()
-    # A missing import should not lower mathematical promise" —
-    # The specific diagnostic text (unknown module prefix,
-    # bad import, etc.) is still preserved verbatim in the raw `output`
-    # field, so nothing is actually lost -- just not its own category.
     if (
         "unknown module prefix" in text
         or ("no directory" in text and ".olean" in text)
-        or "bad import" in text
-        or "unknown identifier" in text
-        or "unknown constant" in text
-        or "unknown namespace" in text
+        or ("object file" in text and ".olean" in text and "does not exist" in text)
     ):
+        return "missing_mathlib_dependency"
+    if "bad import" in text:
+        return "stale_or_moved_mathlib_module"
+    if "unknown identifier" in text or "unknown constant" in text or "unknown namespace" in text:
         return "missing_definition_or_library_lemma"
     if "type mismatch" in text or "failed to synthesize" in text:
         return "elaboration_type_mismatch"
@@ -829,7 +828,8 @@ class ProofWorkflow:
             if repair["translatable"] and repair["lean_code"]:
                 lean_code = repair["lean_code"]
                 lean_name = repair["lean_name"] or lean_name
-                equivalence_category = ""
+                review = self.llm.check_equivalence(theorem, claim_statement, lean_code)
+                equivalence_category = relation_to_category.get(review["relation"], "")
             else:
                 equivalence_category = "likely_mathematical_gap"
 
