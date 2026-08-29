@@ -19,7 +19,6 @@ import json
 import os
 import re
 from unittest import result
-from unittest import result
 import urllib.request
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -152,13 +151,13 @@ def _formalize_prompt(theorem: str, move_summary: str, claim_statement: str, con
         f"    what was left as `sorry`"
     )
 
-
-def _equivalence_prompt(claim_statement: str, lean_code: str) -> str:
+def _equivalence_prompt(theorem: str, claim_statement: str, lean_code: str) -> str:
     return (
         f"You are reviewing a Lean 4 translation for faithfulness to an informal claim.\n"
         f"Do not judge whether the Lean code compiles — only whether, if it did compile,\n"
         f"it would say the same mathematical thing as the informal claim: same quantifiers,\n"
         f"same domain, same strength.\n"
+        f"Theorem being worked on: {theorem}\n"
         f"Informal claim: {claim_statement}\n"
         f"Lean 4 statement:\n{lean_code}\n"
         f"Return ONLY a JSON object with exactly these keys:\n"
@@ -317,8 +316,10 @@ class LLMClient(ABC):
             self._respond(_formalize_prompt(theorem, move_summary, claim_statement, context))
         )
 
-    def check_equivalence(self, claim_statement: str, lean_code: str) -> dict:
-        return _normalize_equivalence(self._respond(_equivalence_prompt(claim_statement, lean_code)))
+    def check_equivalence(self, theorem: str, claim_statement: str, lean_code: str) -> dict:
+        return _normalize_equivalence(
+            self._respond(_equivalence_prompt(theorem, claim_statement, lean_code))
+        )
 
     def repair_formalization(
         self, theorem: str, claim_statement: str, lean_code: str, diagnostic: str, category: str, context: dict,
@@ -512,7 +513,7 @@ class LeanChecker:
     def __init__(
         self,
         binary: str = "lean",
-        timeout_seconds: int = 20,
+        timeout_seconds: int = 45,
         use_lake: bool = False,
         lake_project_dir: str = "",
     ):
@@ -573,6 +574,7 @@ class LeanChecker:
         source_hash, error_category (only set on a genuine compiler failure).
         """
         toolchain = toolchain or self._resolve_toolchain()
+        print("DEBUG toolchain resolved to:", repr(toolchain))
         mathlib_revision = mathlib_revision or (
             self._resolve_mathlib_revision() if self.use_lake else ""
         )
@@ -800,7 +802,7 @@ class ProofWorkflow:
         namespace = f"Proof_{_lean_identifier(project.proof_id)}"
 
         # as the informal claim, before we ever bother invoking Lean? -----------
-        review = self.llm.check_equivalence(claim_statement, lean_code)
+        review = self.llm.check_equivalence(theorem,claim_statement, lean_code)
         relation_to_category = {
             "stronger": "formal_statement_stronger_than_informal",
             "weaker": "translation_ambiguity",
@@ -818,8 +820,11 @@ class ProofWorkflow:
             if repair["translatable"] and repair["lean_code"]:
                 lean_code = repair["lean_code"]
                 lean_name = repair["lean_name"] or lean_name
-                review = self.llm.check_equivalence(claim_statement, lean_code)
-                equivalence_category = relation_to_category.get(review["relation"], "")
+                review = self.llm.check_equivalence(theorem,claim_statement, lean_code)
+                if review["relation"] == "stronger":
+                    equivalence_category = "formal_statement_stronger_than_informal"
+                else:
+                    equivalence_category = ""
             else:
                 # Repair agent judged this a genuine mathematical gap, not a
                 # fixable translation slip — expose it rather than keep trying.
@@ -850,6 +855,7 @@ class ProofWorkflow:
                         deny_sorry=True,
                     )
                     final_status = check.get("status", "unavailable")
+        
 
         # --- commit source + log as artifacts 
         source_artifact = project.write_artifact(
@@ -862,19 +868,22 @@ class ProofWorkflow:
             )
 
         # --- write the claim + its Lean metadata 
+        resolved_toolchain = check.get("toolchain") or self.toolchain
+        resolved_mathlib_revision = check.get("mathlib_revision") or self.mathlib_revision
+
         project.add_claim(claim_id, claim_statement)
         project.link_produced_claim(attempt_id, claim_id)
         project.record_lean_formalization(
             claim_id, lean_name=lean_name, lean_statement_path=source_artifact["path"],
-            namespace=namespace, toolchain_hash=self.toolchain,
-            mathlib_revision=self.mathlib_revision, formalization_status=final_status,
+            namespace=namespace, toolchain_hash=resolved_toolchain,
+            mathlib_revision=resolved_mathlib_revision, formalization_status=final_status,
             last_compiler_output=check.get("output", review.get("notes", "")),
         )
 
         # --- record the verification 
         project.add_verification(
             attempt_id, claim_id, kind="lean", status=final_status, lean_name=lean_name,
-            toolchain_hash=self.toolchain, mathlib_revision=self.mathlib_revision,
+            toolchain_hash=resolved_toolchain, mathlib_revision=resolved_mathlib_revision,
             error_category=check.get("error_category", equivalence_category),
             axioms_used=check.get("axioms_used", []), timing_seconds=check.get("timing_seconds", 0.0),
             source_hash=check.get("source_hash", ""),
