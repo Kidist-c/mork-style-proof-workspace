@@ -76,8 +76,6 @@ LEAN_ERROR_CATEGORIES = (
     "inconsistent_assumptions",
     "likely_mathematical_gap",
    "formal_statement_stronger_than_informal",
-   "stale_or_moved_mathlib_module",
-   "missing_mathlib_dependency"
 )
 
 MATHLIB_GUIDANCE = (
