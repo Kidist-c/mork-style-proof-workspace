@@ -18,7 +18,6 @@ import hashlib
 import json
 import os
 import re
-from unittest import result
 import urllib.request
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -574,7 +573,6 @@ class LeanChecker:
         source_hash, error_category (only set on a genuine compiler failure).
         """
         toolchain = toolchain or self._resolve_toolchain()
-        print("DEBUG toolchain resolved to:", repr(toolchain))
         mathlib_revision = mathlib_revision or (
             self._resolve_mathlib_revision() if self.use_lake else ""
         )
