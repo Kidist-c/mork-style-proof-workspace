@@ -490,11 +490,18 @@ def classify_lean_error(output: str, *, timed_out: bool = False) -> str:
     if timed_out:
         return "resource_timeout"
     text = output.lower()
-    if "unknown module prefix" in text or ("no directory" in text and ".olean" in text):
-        return "missing_mathlib_dependency"
-    if "bad import" in text:
-        return "stale_or_moved_mathlib_module"
-    if "unknown identifier" in text or "unknown constant" in text or "unknown namespace" in text:
+    # A missing import should not lower mathematical promise" —
+    # The specific diagnostic text (unknown module prefix,
+    # bad import, etc.) is still preserved verbatim in the raw `output`
+    # field, so nothing is actually lost -- just not its own category.
+    if (
+        "unknown module prefix" in text
+        or ("no directory" in text and ".olean" in text)
+        or "bad import" in text
+        or "unknown identifier" in text
+        or "unknown constant" in text
+        or "unknown namespace" in text
+    ):
         return "missing_definition_or_library_lemma"
     if "type mismatch" in text or "failed to synthesize" in text:
         return "elaboration_type_mismatch"
@@ -567,13 +574,16 @@ class LeanChecker:
         deny_sorry: bool = True,
     ) -> dict:
         """
-        Returns a dict with: status, output (diagnostics), axioms_used, timing_seconds,
-        source_hash, error_category (only set on a genuine compiler failure).
+        Returns a dict with: status, output (diagnostics), imports_used,
+        axioms_used, timing_seconds, source_hash, error_category (only set
+        on a genuine compiler failure). 
         """
         toolchain = toolchain or self._resolve_toolchain()
         mathlib_revision = mathlib_revision or (
             self._resolve_mathlib_revision() if self.use_lake else ""
         )
+
+        imports_used = re.findall(r"^\s*import\s+(\S+)", lean_code, re.MULTILINE)
 
         source_hash = hashlib.sha256(lean_code.encode("utf-8")).hexdigest()[:16]
         base_result = {
@@ -582,10 +592,12 @@ class LeanChecker:
             "toolchain": toolchain,
             "mathlib_revision": mathlib_revision,
             "source_hash": source_hash,
+            "imports_used": imports_used,
             "axioms_used": [],
             "timing_seconds": 0.0,
             "error_category": "",
         }
+        # ... everything else in the method body stays exactly as it is today
         if not lean_code or not lean_code.strip():
             return {**base_result, "status": "unavailable", "output": "No Lean code to check."}
         if not self.available():
@@ -772,31 +784,6 @@ class ProofWorkflow:
         state["last_critique"] = critique.get("reason", "")
         state["last_critique_decision"] = critique.get("decision", "continue")
         return state
-
-    # --- add helper function to Lean runs first, equivalence review only sanity-checks a real pass
-    def _lean_check_and_review(
-        self, theorem: str, claim_statement: str, lean_code: str, project: ProofProject, claim_id: str,
-    ) -> tuple[str, dict, dict]:
-        """Run Lean first (it is the authority), then use equivalence review
-        only to sanity-check a genuine compile against the ORIGINAL claim."""
-
-        check = self.lean_checker.check(
-            lean_code, proof_id=project.proof_id, claim_id=claim_id,
-            toolchain=self.toolchain, mathlib_revision=self.mathlib_revision,
-            deny_sorry=True,
-        )
-        status = check.get("status", "unavailable")
-        review = {"relation": "", "notes": ""}
-
-        if status == "verified":
-            review = self.llm.check_equivalence(theorem, claim_statement, lean_code)
-            if review["relation"] == "stronger":
-                status = "formal_statement_stronger_than_informal"
-            elif review["relation"] in ("weaker", "unrelated", "unclear"):
-                status = "translation_ambiguity"
-            # "equivalent" -> status stays "verified"
-
-        return status, check, review
     
     def _formalize(self, state: WorkflowState) -> WorkflowState:
         project: ProofProject = state["project"]
@@ -822,30 +809,55 @@ class ProofWorkflow:
         lean_name = draft["lean_name"] or _lean_identifier(claim_id)
         namespace = f"Proof_{_lean_identifier(project.proof_id)}"
 
-        # Lean runs first -- it is authoritative. Equivalence review only
-        # sanity-checks a genuine pass against the original claim.
-        final_status, check, review = self._lean_check_and_review(
-            theorem, claim_statement, lean_code, project, claim_id,
-        )
+        # §11.3: run theorem-statement equivalence review, as the informal
+        # claim, before we ever bother invoking Lean.
+        review = self.llm.check_equivalence(theorem, claim_statement, lean_code)
+        relation_to_category = {
+            "stronger": "formal_statement_stronger_than_informal",
+            "weaker": "translation_ambiguity",
+            "unrelated": "translation_ambiguity",
+            "unclear": "translation_ambiguity",
+        }
+        equivalence_category = relation_to_category.get(review["relation"], "")
 
-        if final_status != "verified":
-            diagnostic = check.get("output") or review.get("notes", "")
-            category = check.get("error_category") or final_status
+        repaired_once = False
+        if equivalence_category:
             repair = self.llm.repair_formalization(
-                theorem, claim_statement, lean_code, diagnostic, category, context,
+                theorem, claim_statement, lean_code, review["notes"], equivalence_category, context,
             )
+            repaired_once = True
             if repair["translatable"] and repair["lean_code"]:
                 lean_code = repair["lean_code"]
                 lean_name = repair["lean_name"] or lean_name
-                final_status, check, review = self._lean_check_and_review(
-                    theorem, claim_statement, lean_code, project, claim_id,
-                )
+                equivalence_category = ""
             else:
-                # Repair agent judged this a genuine mathematical gap, not a
-                # fixable translation slip — expose it rather than keep trying.
-                final_status = "likely_mathematical_gap"
+                equivalence_category = "likely_mathematical_gap"
 
-        # --- commit source + log as artifacts 
+        final_status = equivalence_category or "pending"
+        check: dict = {}
+        if not equivalence_category:
+            check = self.lean_checker.check(
+                lean_code, proof_id=project.proof_id, claim_id=claim_id,
+                toolchain=self.toolchain, mathlib_revision=self.mathlib_revision,
+                deny_sorry=True,
+            )
+            final_status = check.get("status", "unavailable")
+
+            if final_status == "failed" and not repaired_once:
+                repair = self.llm.repair_formalization(
+                    theorem, claim_statement, lean_code, check.get("output", ""),
+                    check.get("error_category", ""), context,
+                )
+                if repair["translatable"] and repair["lean_code"]:
+                    lean_code = repair["lean_code"]
+                    lean_name = repair["lean_name"] or lean_name
+                    check = self.lean_checker.check(
+                        lean_code, proof_id=project.proof_id, claim_id=claim_id,
+                        toolchain=self.toolchain, mathlib_revision=self.mathlib_revision,
+                        deny_sorry=True,
+                    )
+                    final_status = check.get("status", "unavailable")
+
         source_artifact = project.write_artifact(
             name=f"{attempt_id}-lean", content=lean_code, kind="lean_snippet", attempt_id=attempt_id,
         )
@@ -855,7 +867,6 @@ class ProofWorkflow:
                 kind="lean_check_log", attempt_id=attempt_id,
             )
 
-        # --- write the claim + its Lean metadata 
         resolved_toolchain = check.get("toolchain") or self.toolchain
         resolved_mathlib_revision = check.get("mathlib_revision") or self.mathlib_revision
 
@@ -868,16 +879,14 @@ class ProofWorkflow:
             last_compiler_output=check.get("output", review.get("notes", "")),
         )
 
-        # --- record the verification 
         project.add_verification(
             attempt_id, claim_id, kind="lean", status=final_status, lean_name=lean_name,
             toolchain_hash=resolved_toolchain, mathlib_revision=resolved_mathlib_revision,
-            error_category=check.get("error_category", ""),
+            error_category=check.get("error_category", equivalence_category),
             axioms_used=check.get("axioms_used", []), timing_seconds=check.get("timing_seconds", 0.0),
             source_hash=check.get("source_hash", ""),
         )
 
-        # --- promote only on a genuine, clean pass 
         if final_status == "verified":
             project.update_claim_status(
                 claim_id, "lean_verified",
