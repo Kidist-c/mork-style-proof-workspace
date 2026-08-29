@@ -776,6 +776,31 @@ class ProofWorkflow:
         state["last_critique"] = critique.get("reason", "")
         state["last_critique_decision"] = critique.get("decision", "continue")
         return state
+
+    # --- add helper function to Lean runs first, equivalence review only sanity-checks a real pass
+    def _lean_check_and_review(
+        self, theorem: str, claim_statement: str, lean_code: str, project: ProofProject, claim_id: str,
+    ) -> tuple[str, dict, dict]:
+        """Run Lean first (it is the authority), then use equivalence review
+        only to sanity-check a genuine compile against the ORIGINAL claim."""
+
+        check = self.lean_checker.check(
+            lean_code, proof_id=project.proof_id, claim_id=claim_id,
+            toolchain=self.toolchain, mathlib_revision=self.mathlib_revision,
+            deny_sorry=True,
+        )
+        status = check.get("status", "unavailable")
+        review = {"relation": "", "notes": ""}
+
+        if status == "verified":
+            review = self.llm.check_equivalence(theorem, claim_statement, lean_code)
+            if review["relation"] == "stronger":
+                status = "formal_statement_stronger_than_informal"
+            elif review["relation"] in ("weaker", "unrelated", "unclear"):
+                status = "translation_ambiguity"
+            # "equivalent" -> status stays "verified"
+
+        return status, check, review
     
     def _formalize(self, state: WorkflowState) -> WorkflowState:
         project: ProofProject = state["project"]
