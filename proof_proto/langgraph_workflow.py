@@ -809,7 +809,7 @@ class ProofWorkflow:
         lean_name = draft["lean_name"] or _lean_identifier(claim_id)
         namespace = f"Proof_{_lean_identifier(project.proof_id)}"
 
-        # §11.3: run theorem-statement equivalence review, as the informal
+    
         # claim, before we ever bother invoking Lean.
         review = self.llm.check_equivalence(theorem, claim_statement, lean_code)
         relation_to_category = {
@@ -898,6 +898,21 @@ class ProofWorkflow:
 
         state["last_lean_status"] = final_status
         return self._maybe_close(state)
+
+
+    def _maybe_close(self, state: WorkflowState) -> WorkflowState:
+        """Run the formal verifier now that the critic's verdict and any Lean check
+        are both recorded on the attempt, so a genuine Lean pass can close the
+        state exactly like a critic acceptance can (both are in FormalVerifier's
+        accepted_statuses).
+        """
+        project: ProofProject = state["project"]
+        all_attempts = project.graph.get_attempts_for_state(ROOT_STATE_ID, project.proof_id)
+        verdict = self.verifier.verify(state["theorem"], all_attempts)
+        if verdict["closed"] or state.get("last_critique_decision") == "stop":
+            project.close_state(ROOT_STATE_ID, verdict["reason"] or state.get("last_critique", ""))
+            state["proof_closed"] = True
+        return state
     
     # --- routing ----------------------------------------------------------
 
