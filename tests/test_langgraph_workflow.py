@@ -63,7 +63,7 @@ class DummyLLM:
             "explanation": "Statement stub only; case split left as future work.",
         }
 
-    def check_equivalence(self, claim_statement: str, lean_code: str) -> dict:
+    def check_equivalence(self, theorem: str,claim_statement: str, lean_code: str) -> dict:
         return {"relation": "equivalent", "notes": "Matches the informal claim."}
 
     def repair_formalization(
@@ -98,7 +98,7 @@ class MistranslatedThenRepairedLLM(DummyLLM):
             "explanation": "first (bad) draft",
         }
 
-    def check_equivalence(self, claim_statement: str, lean_code: str) -> dict:
+    def check_equivalence(self, theorem: str, claim_statement: str, lean_code: str) -> dict:
         if not self._reviewed_once:
             self._reviewed_once = True
             return {"relation": "unrelated", "notes": "Does not mention parity at all."}
